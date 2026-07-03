@@ -55,11 +55,8 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-<<<<<<< Updated upstream
-=======
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart1_rx;
->>>>>>> Stashed changes
 extern UART_HandleTypeDef huart1;
 /* USER CODE BEGIN EV */
 
@@ -204,8 +201,6 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
-<<<<<<< Updated upstream
-=======
   * @brief This function handles DMA1 channel5 global interrupt.
   */
 void DMA1_Channel5_IRQHandler(void)
@@ -234,7 +229,6 @@ void TIM2_IRQHandler(void)
 }
 
 /**
->>>>>>> Stashed changes
   * @brief This function handles USART1 global interrupt.
   */
 void USART1_IRQHandler(void)
