@@ -42,26 +42,22 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
-uint8_t uart_rx_byte = 0;
+#define UART_DMA_RX_LEN 8
 
-char uart_rx_buf[64];
-char uart_cmd_buf[64];
+uint8_t uart_dma_rx_buf[UART_DMA_RX_LEN];
 
-volatile uint8_t uart_rx_index = 0;
-volatile uint8_t uart_cmd_ready = 0;
+volatile uint8_t uart_dma_rx_done = 0;
 
 uint32_t last_blink_tick = 0;
-
-/* 先用模拟数据，后面替换成真实 CPS 和脉宽 */
-uint32_t cps_value = 0;
-uint32_t width_us = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void Process_Command(char *cmd);
@@ -101,9 +97,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+  HAL_UART_Receive_DMA(&huart1, uart_dma_rx_buf, UART_DMA_RX_LEN);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -114,10 +111,22 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    if (uart_cmd_ready)
+    if (uart_dma_rx_done)
     {
-        uart_cmd_ready = 0;
-        Process_Command(uart_cmd_buf);
+        uart_dma_rx_done = 0;
+
+        char msg[128];
+
+        sprintf(msg, "DMA RX: ");
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        HAL_UART_Transmit(&huart1, uart_dma_rx_buf, UART_DMA_RX_LEN, HAL_MAX_DELAY);
+
+        sprintf(msg, "\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        /* 重新启动下一轮 DMA 接收 */
+        HAL_UART_Receive_DMA(&huart1, uart_dma_rx_buf, UART_DMA_RX_LEN);
     }
 
     if (HAL_GetTick() - last_blink_tick >= 500)
@@ -125,10 +134,10 @@ int main(void)
         last_blink_tick = HAL_GetTick();
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
-  }
 
     /* USER CODE END 3 */
   }
+}
 
 /**
   * @brief System Clock Configuration
@@ -200,6 +209,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -232,77 +257,11 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void Process_Command(char *cmd)
-{
-    char msg[128];
-
-    if (strcmp(cmd, "status") == 0)
-    {
-        sprintf(msg, "CPS=%lu, WIDTH=%lu us\r\n", cps_value, width_us);
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    }
-    else if (strcmp(cmd, "reset") == 0)
-    {
-        cps_value = 0;
-        width_us = 0;
-
-        sprintf(msg, "Counter reset.\r\n");
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    }
-    else if (strcmp(cmd, "help") == 0)
-    {
-        sprintf(msg,
-                "Commands:\r\n"
-                "  status  - show CPS and width\r\n"
-                "  reset   - reset values\r\n"
-                "  help    - show commands\r\n");
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    }
-    else
-    {
-        sprintf(msg, "Unknown command: %s\r\n", cmd);
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    }
-}
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        char ch = (char)uart_rx_byte;
-
-        if (uart_cmd_ready == 0)
-        {
-            if (ch == '\r')
-            {
-                /* 忽略回车 */
-            }
-            else if (ch == '\n')
-            {
-                /* 一条命令结束 */
-                uart_rx_buf[uart_rx_index] = '\0';
-
-                strcpy(uart_cmd_buf, uart_rx_buf);
-
-                uart_rx_index = 0;
-                uart_cmd_ready = 1;
-            }
-            else
-            {
-                if (uart_rx_index < sizeof(uart_rx_buf) - 1)
-                {
-                    uart_rx_buf[uart_rx_index++] = ch;
-                }
-                else
-                {
-                    /* 命令太长，清空缓冲区 */
-                    uart_rx_index = 0;
-                }
-            }
-        }
-
-        /* 重新启动下一次 1 字节接收 */
-        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        uart_dma_rx_done = 1;
     }
 }
 
