@@ -1,0 +1,35 @@
+# Build output
+Debug/
+Release/
+build/
+Build/
+
+# Object and binary files
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.d
+*.su
+
+# Keil temporary files
+Listings/
+Objects/
+*.uvguix.*
+*.scvd
+*.dep
+*.crf
+*.htm
+*.lnp
+
+# CubeIDE / Eclipse temporary files
+.metadata/
+.cache/
+.settings/language.settings.xml
+
+# OS files
+.DS_Store
+Thumbs.db
