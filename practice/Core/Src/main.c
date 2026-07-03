@@ -41,9 +41,12 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+<<<<<<< Updated upstream
 uint8_t uart_rx_byte = 0;
 
 char uart_rx_buf[64];
@@ -51,7 +54,16 @@ char uart_cmd_buf[64];
 
 volatile uint8_t uart_rx_index = 0;
 volatile uint8_t uart_cmd_ready = 0;
+=======
+volatile uint32_t ic_rise = 0;
+volatile uint32_t ic_fall = 0;
+volatile uint32_t pulse_width_us = 0;
+volatile uint8_t  waiting_falling = 0;
+volatile uint8_t  width_ready = 0;
+>>>>>>> Stashed changes
 
+volatile uint32_t pulse_count = 0;
+uint32_t last_report_tick = 0;
 uint32_t last_blink_tick = 0;
 
 /* 先用模拟数据，后面替换成真实 CPS 和脉宽 */
@@ -63,6 +75,7 @@ uint32_t width_us = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 void Process_Command(char *cmd);
 /* USER CODE END PFP */
@@ -102,8 +115,13 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+<<<<<<< Updated upstream
   HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+=======
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+>>>>>>> Stashed changes
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -114,10 +132,23 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+<<<<<<< Updated upstream
     if (uart_cmd_ready)
     {
         uart_cmd_ready = 0;
         Process_Command(uart_cmd_buf);
+=======
+    if (HAL_GetTick() - last_report_tick >= 1000)
+    {
+        last_report_tick += 1000;
+
+        uint32_t cps = pulse_count;
+        pulse_count = 0;
+
+        char msg[80];
+        sprintf(msg, "CPS=%lu, WIDTH=%lu us\r\n", cps, pulse_width_us);
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+>>>>>>> Stashed changes
     }
 
     if (HAL_GetTick() - last_blink_tick >= 500)
@@ -164,6 +195,64 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 7;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
 }
 
 /**
@@ -232,6 +321,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+<<<<<<< Updated upstream
 void Process_Command(char *cmd)
 {
     char msg[128];
@@ -266,9 +356,13 @@ void Process_Command(char *cmd)
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+=======
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+>>>>>>> Stashed changes
 {
-    if (huart->Instance == USART1)
+    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
+<<<<<<< Updated upstream
         char ch = (char)uart_rx_byte;
 
         if (uart_cmd_ready == 0)
@@ -303,6 +397,38 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
         /* 重新启动下一次 1 字节接收 */
         HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+=======
+        if (waiting_falling == 0)
+        {
+            /* 捕获到上升沿 */
+            ic_rise = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            waiting_falling = 1;
+
+            /* 下一次改为捕获下降沿 */
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
+        }
+        else
+        {
+            /* 捕获到下降沿 */
+            ic_fall = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+            if (ic_fall >= ic_rise)
+            {
+                pulse_width_us = ic_fall - ic_rise;
+            }
+            else
+            {
+                pulse_width_us = (65536 - ic_rise) + ic_fall;
+            }
+
+            pulse_count++;
+            width_ready = 1;
+            waiting_falling = 0;
+
+            /* 下一次重新捕获上升沿 */
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+        }
+>>>>>>> Stashed changes
     }
 }
 
