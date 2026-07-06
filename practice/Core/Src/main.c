@@ -32,7 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TIM2_CLK_HZ 72000000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,12 +53,11 @@ volatile uint32_t pulse_width_us = 0;
 volatile uint8_t  waiting_falling = 0;
 volatile uint8_t  width_ready = 0;
 volatile uint32_t pulse_count = 0;
+volatile uint32_t width_ns = 0;
 uint32_t last_report_tick = 0;
 uint32_t last_blink_tick = 0;
 
-/* 先用模拟数据，后面替换成真实 CPS 和脉宽 */
-uint32_t cps_value = 0;
-uint32_t width_us = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,7 +127,8 @@ int main(void)
         pulse_count = 0;
 
         char msg[80];
-        sprintf(msg, "CPS=%lu, WIDTH=%lu us\r\n", cps, pulse_width_us);
+
+        sprintf(msg, "CPS=%lu, WIDTH=%lu ns\r\n", cps, width_ns);
         HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
     }
 
@@ -154,10 +154,13 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -167,12 +170,12 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -198,7 +201,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 7;
+  htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 65535;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -299,6 +302,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
@@ -324,32 +328,32 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     {
         if (waiting_falling == 0)
         {
-            /* 捕获到上升沿 */
+
             ic_rise = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
             waiting_falling = 1;
 
-            /* 下一次改为捕获下降沿 */
+
             __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
         }
         else
         {
-            /* 捕获到下降沿 */
+
             ic_fall = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
 
             if (ic_fall >= ic_rise)
             {
                 pulse_width_us = ic_fall - ic_rise;
+                width_ns = (pulse_width_us * 125UL + 4) / 9;
             }
             else
             {
                 pulse_width_us = (65536 - ic_rise) + ic_fall;
+                width_ns = (pulse_width_us * 125UL + 4) / 9;
             }
 
             pulse_count++;
             width_ready = 1;
             waiting_falling = 0;
-
-            /* 下一次重新捕获上升沿 */
             __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
         }
     }
