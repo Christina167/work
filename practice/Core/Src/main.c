@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TIM2_CLK_HZ 72000000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,16 +48,46 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
+
+#define TIM2_CLK_HZ        72000000UL
+#define WIDTH_BUF_SIZE     4096
+#define UART_CMD_BUF_SIZE  64
+
+
+/* UART 命令行 */
+
+uint8_t uart_rx_byte = 0;
+
+char uart_rx_buf[UART_CMD_BUF_SIZE];
+char uart_cmd_buf[UART_CMD_BUF_SIZE];
+
+volatile uint8_t uart_rx_index = 0;
+volatile uint8_t uart_cmd_ready = 0;
+
+
+/* 脉宽采集 */
+
+volatile uint16_t width_buf[WIDTH_BUF_SIZE];
+
+volatile uint32_t width_count = 0;
+volatile uint8_t acquisition_on = 0;
+
+uint32_t acquisition_start_tick = 0;
+uint32_t acquisition_duration_ms = 0;
+
+
+volatile uint8_t acquisition_done = 0;
+
+volatile uint16_t last_width_ticks = 0;
+
+
+/* TIM2 输入 */
+
 volatile uint32_t ic_rise = 0;
 volatile uint32_t ic_fall = 0;
-volatile uint32_t pulse_width_us = 0;
-volatile uint8_t  waiting_falling = 0;
-volatile uint8_t  width_ready = 0;
-volatile uint32_t pulse_count = 0;
-volatile uint32_t width_ns = 0;
-uint32_t last_report_tick = 0;
-uint32_t last_blink_tick = 0;
+volatile uint8_t waiting_falling = 0;
 
+uint32_t last_blink_tick = 0;
 
 /* USER CODE END PV */
 
@@ -67,9 +98,13 @@ static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-void Process_Command(char *cmd);
-/* USER CODE END PFP */
 
+void Process_Command(char *cmd);
+void Uart_SendString(const char *s);
+static uint32_t Ticks_To_Ns(uint16_t ticks);
+static void Save_Width_Ticks(uint16_t width_ticks);
+
+/* USER CODE END PFP */
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
@@ -108,7 +143,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+
+  __HAL_TIM_SET_CAPTUREPOLARITY(&htim2, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+
+  Uart_SendString("Usage: start_n (n seconds, up to 4096 pulses), dump (export data)\r\n\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -119,17 +161,40 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    if (HAL_GetTick() - last_report_tick >= 1000)
+    if (uart_cmd_ready)
     {
-        last_report_tick += 1000;
+        uart_cmd_ready = 0;
+        Process_Command(uart_cmd_buf);
+    }
 
-        uint32_t cps = pulse_count;
-        pulse_count = 0;
+    if (acquisition_on)
+    {
+        if (HAL_GetTick() - acquisition_start_tick >= acquisition_duration_ms)
+        {
+            acquisition_on = 0;
+            acquisition_done = 1;
+        }
+    }
 
-        char msg[80];
+    if (acquisition_done)
+    {
+        char msg[96];
 
-        sprintf(msg, "CPS=%lu, WIDTH=%lu ns\r\n", cps, width_ns);
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        if (acquisition_done == 1)
+        {
+            sprintf(msg, "Acquisition finished. N=%lu\r\n", width_count);
+        }
+        else if (acquisition_done == 2)
+        {
+            sprintf(msg, "Buffer full. Acquisition stopped. N=%lu\r\n", width_count);
+        }
+        else
+        {
+            sprintf(msg, "Acquisition stopped. N=%lu\r\n", width_count);
+        }
+
+        acquisition_done = 0;
+        Uart_SendString(msg);
     }
 
     if (HAL_GetTick() - last_blink_tick >= 500)
@@ -137,9 +202,9 @@ int main(void)
         last_blink_tick = HAL_GetTick();
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
-  }
 
-  /* USER CODE END 3 */
+    /* USER CODE END 3 */
+  }
 }
 
 /**
@@ -322,38 +387,185 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/* 串口发送 */
+
+void Uart_SendString(const char *s)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
+}
+
+
+/* tick 转 ns */
+static uint32_t Ticks_To_Ns(uint16_t ticks)
+{
+    return (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIM2_CLK_HZ);
+}
+
+
+/* 保存脉宽 */
+static void Save_Width_Ticks(uint16_t width_ticks)
+{
+    last_width_ticks = width_ticks;
+
+    if (acquisition_on)
+    {
+        if (width_count < WIDTH_BUF_SIZE)
+        {
+            width_buf[width_count] = width_ticks;
+            width_count++;
+        }
+        else
+        {
+            acquisition_on = 0;
+            acquisition_done = 2;
+        }
+    }
+}
+
+
+/* 命令处理 */
+void Process_Command(char *cmd)
+{
+    char msg[128];
+
+    if (strncmp(cmd, "start_", 6) == 0)
+    {
+        int seconds = atoi(&cmd[6]);
+
+        if (seconds <= 0)
+        {
+            Uart_SendString("ERROR: %s\r\n");
+            return;
+        }
+
+        __disable_irq();
+
+        width_count = 0;
+        last_width_ticks = 0;
+        waiting_falling = 0;
+
+        acquisition_duration_ms = (uint32_t)seconds * 1000UL;
+        acquisition_start_tick = HAL_GetTick();
+        acquisition_done = 0;
+        acquisition_on = 1;
+
+        __enable_irq();
+
+        __HAL_TIM_SET_CAPTUREPOLARITY(&htim2,TIM_CHANNEL_1,TIM_INPUTCHANNELPOLARITY_RISING);
+
+        sprintf(msg, "Acquisition started for %d s.\r\n",seconds);
+
+        Uart_SendString(msg);
+    }
+    else if (strcmp(cmd, "dump") == 0)
+    {
+        acquisition_on = 0;
+
+        uint32_t n;
+
+        __disable_irq();
+        n = width_count;
+        __enable_irq();
+
+        sprintf(msg, "N=%lu,TIMCLK=%lu\r\n", n, TIM2_CLK_HZ);
+        Uart_SendString(msg);
+
+        Uart_SendString("index,width_ns\r\n");
+
+        for (uint32_t i = 0; i < n; i++)
+        {
+            uint16_t ticks = width_buf[i];
+            uint32_t ns = Ticks_To_Ns(ticks);
+
+            sprintf(msg, "%lu,%lu\r\n", i , ns);
+            Uart_SendString(msg);
+        }
+
+        Uart_SendString("END\r\n");
+    }
+    else
+    {
+        sprintf(msg, "ERROR: %s\r\n", cmd);
+        Uart_SendString(msg);
+    }
+}
+
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        char ch = (char)uart_rx_byte;
+
+        if (uart_cmd_ready == 0)
+        {
+            if (ch == '\r')
+            {
+
+            }
+            else if (ch == '\n')
+            {
+                uart_rx_buf[uart_rx_index] = '\0';
+
+                strcpy(uart_cmd_buf, uart_rx_buf);
+
+                uart_rx_index = 0;
+                uart_cmd_ready = 1;
+            }
+            else
+            {
+                if (uart_rx_index < UART_CMD_BUF_SIZE - 1)
+                {
+                    uart_rx_buf[uart_rx_index] = ch;
+                    uart_rx_index++;
+                }
+                else
+                {
+                    uart_rx_index = 0;
+                }
+            }
+        }
+
+        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+    }
+}
+
+
+/* TIM2 输入 */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
         if (waiting_falling == 0)
         {
-
             ic_rise = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
             waiting_falling = 1;
 
-
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim,
+                                          TIM_CHANNEL_1,
+                                          TIM_INPUTCHANNELPOLARITY_FALLING);
         }
         else
         {
 
             ic_fall = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
 
+            uint32_t width_ticks_32;
+
             if (ic_fall >= ic_rise)
             {
-                pulse_width_us = ic_fall - ic_rise;
-                width_ns = (pulse_width_us * 125UL + 4) / 9;
+                width_ticks_32 = ic_fall - ic_rise;
             }
             else
             {
-                pulse_width_us = (65536 - ic_rise) + ic_fall;
-                width_ns = (pulse_width_us * 125UL + 4) / 9;
+                width_ticks_32 = (65536UL - ic_rise) + ic_fall;
             }
 
-            pulse_count++;
-            width_ready = 1;
+            Save_Width_Ticks((uint16_t)width_ticks_32);
+
             waiting_falling = 0;
+
+
             __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
         }
     }
