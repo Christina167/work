@@ -3,10 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ===== 配置 =====
-PORT = 'COM7'          # 改成你的实际串口号（设备管理器里看到的）
+PORT = 'COM6'      
 BAUD = 115200
 TIMEOUT = 2
-ACQ_TIME = 2           # 采集秒数，可根据需要修改
+ACQ_TIME = 1           # 采集秒数
 
 # ===== 连接串口 =====
 ser = serial.Serial(PORT, BAUD, timeout=TIMEOUT)

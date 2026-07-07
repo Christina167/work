@@ -89,6 +89,21 @@ volatile uint8_t waiting_falling = 0;
 
 uint32_t last_blink_tick = 0;
 
+volatile uint32_t cyc_cb_total = 0;
+volatile uint32_t cyc_rise_path = 0;
+volatile uint32_t cyc_fall_path = 0;
+volatile uint32_t cyc_read_capture = 0;
+volatile uint32_t cyc_set_polarity = 0;
+
+volatile uint32_t cyc_cb_total_max = 0;
+volatile uint32_t cyc_rise_path_max = 0;
+volatile uint32_t cyc_fall_path_max = 0;
+volatile uint32_t cyc_read_capture_max = 0;
+volatile uint32_t cyc_set_polarity_max = 0;
+
+volatile uint32_t cyc_tim2_irq_total = 0;
+volatile uint32_t cyc_tim2_irq_total_max = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,6 +118,10 @@ void Process_Command(char *cmd);
 void Uart_SendString(const char *s);
 static uint32_t Ticks_To_Ns(uint16_t ticks);
 static void Save_Width_Ticks(uint16_t width_ticks);
+
+static void DWT_Init(void);
+static uint32_t DWT_GetCycles(void);
+static uint32_t Cycles_To_Ns(uint32_t cycles);
 
 /* USER CODE END PFP */
 /* Private user code ---------------------------------------------------------*/
@@ -143,6 +162,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  DWT_Init();
   HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
@@ -386,6 +406,22 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void DWT_Init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static inline uint32_t DWT_GetCycles(void)
+{
+    return DWT->CYCCNT;
+}
+
+static uint32_t Cycles_To_Ns(uint32_t cycles)
+{
+    return (uint32_t)(((uint64_t)cycles * 1000000000ULL) / 72000000ULL);
+}
 
 /* 串口发送 */
 
@@ -483,6 +519,58 @@ void Process_Command(char *cmd)
 
         Uart_SendString("END\r\n");
     }
+    else if (strcmp(cmd, "timing") == 0)
+    {
+        char msg[160];
+
+        sprintf(msg,
+                "IRQ total: last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_tim2_irq_total,
+                Cycles_To_Ns(cyc_tim2_irq_total),
+                cyc_tim2_irq_total_max,
+                Cycles_To_Ns(cyc_tim2_irq_total_max));
+        Uart_SendString(msg);
+
+        sprintf(msg,
+                "CB total:  last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_cb_total,
+                Cycles_To_Ns(cyc_cb_total),
+                cyc_cb_total_max,
+                Cycles_To_Ns(cyc_cb_total_max));
+        Uart_SendString(msg);
+
+        sprintf(msg,
+                "Rise path: last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_rise_path,
+                Cycles_To_Ns(cyc_rise_path),
+                cyc_rise_path_max,
+                Cycles_To_Ns(cyc_rise_path_max));
+        Uart_SendString(msg);
+
+        sprintf(msg,
+                "Fall path: last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_fall_path,
+                Cycles_To_Ns(cyc_fall_path),
+                cyc_fall_path_max,
+                Cycles_To_Ns(cyc_fall_path_max));
+        Uart_SendString(msg);
+
+        sprintf(msg,
+                "Read CCR:  last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_read_capture,
+                Cycles_To_Ns(cyc_read_capture),
+                cyc_read_capture_max,
+                Cycles_To_Ns(cyc_read_capture_max));
+        Uart_SendString(msg);
+
+        sprintf(msg,
+                "Set pol:   last=%lu cyc=%lu ns, max=%lu cyc=%lu ns\r\n",
+                cyc_set_polarity,
+                Cycles_To_Ns(cyc_set_polarity),
+                cyc_set_polarity_max,
+                Cycles_To_Ns(cyc_set_polarity_max));
+        Uart_SendString(msg);
+    }
     else
     {
         sprintf(msg, "ERROR: %s\r\n", cmd);
@@ -536,19 +624,47 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
+        uint32_t t_cb0 = DWT_GetCycles();
+
         if (waiting_falling == 0)
         {
+            uint32_t t_path0 = DWT_GetCycles();
+
+            uint32_t t0 = DWT_GetCycles();
             ic_rise = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            uint32_t t1 = DWT_GetCycles();
+
+            cyc_read_capture = t1 - t0;
+            if (cyc_read_capture > cyc_read_capture_max)
+                cyc_read_capture_max = cyc_read_capture;
+
             waiting_falling = 1;
 
+            t0 = DWT_GetCycles();
             __HAL_TIM_SET_CAPTUREPOLARITY(htim,
                                           TIM_CHANNEL_1,
                                           TIM_INPUTCHANNELPOLARITY_FALLING);
+            t1 = DWT_GetCycles();
+
+            cyc_set_polarity = t1 - t0;
+            if (cyc_set_polarity > cyc_set_polarity_max)
+                cyc_set_polarity_max = cyc_set_polarity;
+
+            cyc_rise_path = DWT_GetCycles() - t_path0;
+            if (cyc_rise_path > cyc_rise_path_max)
+                cyc_rise_path_max = cyc_rise_path;
         }
         else
         {
+            uint32_t t_path0 = DWT_GetCycles();
 
+            uint32_t t0 = DWT_GetCycles();
             ic_fall = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            uint32_t t1 = DWT_GetCycles();
+
+            cyc_read_capture = t1 - t0;
+            if (cyc_read_capture > cyc_read_capture_max)
+                cyc_read_capture_max = cyc_read_capture;
 
             uint32_t width_ticks_32;
 
@@ -565,9 +681,24 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
             waiting_falling = 0;
 
+            t0 = DWT_GetCycles();
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim,
+                                          TIM_CHANNEL_1,
+                                          TIM_INPUTCHANNELPOLARITY_RISING);
+            t1 = DWT_GetCycles();
 
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+            cyc_set_polarity = t1 - t0;
+            if (cyc_set_polarity > cyc_set_polarity_max)
+                cyc_set_polarity_max = cyc_set_polarity;
+
+            cyc_fall_path = DWT_GetCycles() - t_path0;
+            if (cyc_fall_path > cyc_fall_path_max)
+                cyc_fall_path_max = cyc_fall_path;
         }
+
+        cyc_cb_total = DWT_GetCycles() - t_cb0;
+        if (cyc_cb_total > cyc_cb_total_max)
+            cyc_cb_total_max = cyc_cb_total;
     }
 }
 

@@ -58,6 +58,8 @@
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern UART_HandleTypeDef huart1;
+extern volatile uint32_t cyc_tim2_irq_total;
+extern volatile uint32_t cyc_tim2_irq_total_max;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -220,11 +222,15 @@ void DMA1_Channel5_IRQHandler(void)
 void TIM2_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM2_IRQn 0 */
-
+  uint32_t t0 = DWT->CYCCNT;
   /* USER CODE END TIM2_IRQn 0 */
   HAL_TIM_IRQHandler(&htim2);
   /* USER CODE BEGIN TIM2_IRQn 1 */
+  uint32_t dt = DWT->CYCCNT - t0;
 
+  cyc_tim2_irq_total = dt;
+  if (dt > cyc_tim2_irq_total_max)
+        cyc_tim2_irq_total_max = dt;
   /* USER CODE END TIM2_IRQn 1 */
 }
 
