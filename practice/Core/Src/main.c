@@ -42,6 +42,7 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart1;
@@ -84,6 +85,13 @@ volatile uint16_t last_width_ticks = 0;
 
 uint32_t last_blink_tick = 0;
 
+volatile uint16_t rise_ccr1 = 0;
+volatile uint8_t rise_valid = 0;
+
+/* TIM1_ETR */
+volatile uint32_t etr_overflow = 0;
+volatile uint32_t etr_count_latched = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -92,13 +100,15 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 
 void Process_Command(char *cmd);
 void Uart_SendString(const char *s);
 static uint32_t Ticks_To_Ns(uint16_t ticks);
 static void Save_Width_Ticks(uint16_t width_ticks);
-
+static uint32_t Get_ETR_Count(void);
+static void Stop_Acquisition(uint8_t reason);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -138,10 +148,11 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_TIM2_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 
-  HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 
   Uart_SendString("Usage: start_n (n seconds, up to 4096 pulses), dump (export data)\r\n\r\n");
@@ -166,11 +177,9 @@ int main(void)
     {
         if (HAL_GetTick() - acquisition_start_tick >= acquisition_duration_ms)
         {
-            acquisition_on = 0;
-            acquisition_done = 1;
+            Stop_Acquisition(1);
         }
     }
-
     if (acquisition_done)
     {
         char msg[96];
@@ -242,6 +251,55 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_ETRMODE2;
+  sClockSourceConfig.ClockPolarity = TIM_CLOCKPOLARITY_NONINVERTED;
+  sClockSourceConfig.ClockPrescaler = TIM_CLOCKPRESCALER_DIV1;
+  sClockSourceConfig.ClockFilter = 0;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
   * @brief TIM2 Initialization Function
   * @param None
   * @retval None
@@ -254,7 +312,6 @@ static void MX_TIM2_Init(void)
   /* USER CODE END TIM2_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_IC_InitTypeDef sConfigIC = {0};
 
@@ -277,14 +334,6 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_RESET;
-  sSlaveConfig.InputTrigger = TIM_TS_TI1FP1;
-  sSlaveConfig.TriggerPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sSlaveConfig.TriggerFilter = 0;
-  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -411,7 +460,34 @@ static uint32_t Ticks_To_Ns(uint16_t ticks)
     return (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIM2_CLK_HZ);
 }
 
+static uint32_t Get_ETR_Count(void)
+{
+    uint32_t high1, high2;
+    uint16_t low;
 
+    do
+    {
+        high1 = etr_overflow;
+        low = (uint16_t)__HAL_TIM_GET_COUNTER(&htim1);
+        high2 = etr_overflow;
+    } while (high1 != high2);
+
+    return high2 * 65536UL + low;
+}
+
+static void Stop_Acquisition(uint8_t reason)
+{
+    if (acquisition_on)
+    {
+        acquisition_on = 0;
+    }
+
+    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+    __HAL_TIM_DISABLE(&htim1);
+
+    etr_count_latched = Get_ETR_Count();
+    acquisition_done = reason;
+}
 /* 保存脉宽 */
 static void Save_Width_Ticks(uint16_t width_ticks)
 {
@@ -426,12 +502,10 @@ static void Save_Width_Ticks(uint16_t width_ticks)
         }
         else
         {
-            acquisition_on = 0;
-            acquisition_done = 2;
+            Stop_Acquisition(2);
         }
     }
 }
-
 
 /* 命令处理 */
 void Process_Command(char *cmd)
@@ -444,14 +518,25 @@ void Process_Command(char *cmd)
 
         if (seconds <= 0)
         {
-            Uart_SendString("ERROR: %s\r\n");
+            Uart_SendString("ERROR: bad acquisition time\r\n");
             return;
         }
+
+
+        __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+        __HAL_TIM_DISABLE(&htim1);
 
         __disable_irq();
 
         width_count = 0;
         last_width_ticks = 0;
+        rise_ccr1 = 0;
+        rise_valid = 0;
+
+        etr_overflow = 0;
+        etr_count_latched = 0;
+        __HAL_TIM_SET_COUNTER(&htim1, 0);
+        __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
 
         acquisition_duration_ms = (uint32_t)seconds * 1000UL;
         acquisition_start_tick = HAL_GetTick();
@@ -460,9 +545,9 @@ void Process_Command(char *cmd)
 
         __enable_irq();
 
-        sprintf(msg,
-                "Acquisition started for %d s.",seconds,WIDTH_BUF_SIZE);
+        HAL_TIM_Base_Start_IT(&htim1);
 
+        sprintf(msg, "Acquisition started for %d s.\r\n", seconds);
         Uart_SendString(msg);
     }
     else if (strcmp(cmd, "dump") == 0)
@@ -470,22 +555,24 @@ void Process_Command(char *cmd)
         acquisition_on = 0;
 
         uint32_t n;
+        uint32_t etr_n;
 
         __disable_irq();
         n = width_count;
+        etr_n = etr_count_latched;
         __enable_irq();
 
-        sprintf(msg, "N=%lu,TIMCLK=%lu\r\n", n, TIM2_CLK_HZ);
+        sprintf(msg, "N=%lu,TIMCLK=%lu,ETR_COUNT=%lu\r\n", n, TIM2_CLK_HZ, etr_n);
         Uart_SendString(msg);
 
-        Uart_SendString("index,width_ns\r\n");
+        Uart_SendString("index,width_ticks,width_ns\r\n");
 
         for (uint32_t i = 0; i < n; i++)
         {
             uint16_t ticks = width_buf[i];
             uint32_t ns = Ticks_To_Ns(ticks);
 
-            sprintf(msg, "%lu,%lu\r\n", i , ns);
+            sprintf(msg, "%lu,%u,%lu\r\n", i, ticks, ns);
             Uart_SendString(msg);
         }
 
@@ -538,13 +625,35 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
     }
 }
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1)
+    {
+        etr_overflow++;
+    }
+}
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+    if (htim->Instance == TIM2)
     {
-        uint16_t width_ticks = (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+        {
 
-        Save_Width_Ticks(width_ticks);
+            rise_ccr1 = (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            rise_valid = 1;
+        }
+        else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+        {
+            uint16_t fall_ccr2 = (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+
+            if (rise_valid)
+            {
+                uint16_t width_ticks = (uint16_t)(fall_ccr2 - rise_ccr1);
+                rise_valid = 0;
+
+                Save_Width_Ticks(width_ticks);
+            }
+        }
     }
 }
 
