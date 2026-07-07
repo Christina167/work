@@ -461,9 +461,7 @@ void Process_Command(char *cmd)
         __enable_irq();
 
         sprintf(msg,
-                "Acquisition started for %d s. Buffer size=%d\r\n",
-                seconds,
-                WIDTH_BUF_SIZE);
+                "Acquisition started for %d s.",seconds,WIDTH_BUF_SIZE);
 
         Uart_SendString(msg);
     }
@@ -500,7 +498,46 @@ void Process_Command(char *cmd)
     }
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        char ch = (char)uart_rx_byte;
 
+        if (uart_cmd_ready == 0)
+        {
+            if (ch == '\r')
+            {
+
+            }
+            else if (ch == '\n')
+            {
+
+                uart_rx_buf[uart_rx_index] = '\0';
+
+                strcpy(uart_cmd_buf, uart_rx_buf);
+
+                uart_rx_index = 0;
+                uart_cmd_ready = 1;
+            }
+            else
+            {
+                if (uart_rx_index < UART_CMD_BUF_SIZE - 1)
+                {
+                    uart_rx_buf[uart_rx_index] = ch;
+                    uart_rx_index++;
+                }
+                else
+                {
+
+                    uart_rx_index = 0;
+                }
+            }
+        }
+
+        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+    }
+}
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
