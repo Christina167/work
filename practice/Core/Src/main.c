@@ -81,11 +81,6 @@ volatile uint8_t acquisition_done = 0;
 volatile uint16_t last_width_ticks = 0;
 
 
-/* TIM2 输入 */
-
-volatile uint32_t ic_rise = 0;
-volatile uint32_t ic_fall = 0;
-volatile uint8_t waiting_falling = 0;
 
 uint32_t last_blink_tick = 0;
 
@@ -105,6 +100,7 @@ static uint32_t Ticks_To_Ns(uint16_t ticks);
 static void Save_Width_Ticks(uint16_t width_ticks);
 
 /* USER CODE END PFP */
+
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
@@ -145,9 +141,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 
-  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
-
-  __HAL_TIM_SET_CAPTUREPOLARITY(&htim2, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+  HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 
   Uart_SendString("Usage: start_n (n seconds, up to 4096 pulses), dump (export data)\r\n\r\n");
 
@@ -203,7 +198,7 @@ int main(void)
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
 
-    /* USER CODE END 3 */
+  /* USER CODE END 3 */
   }
 }
 
@@ -259,6 +254,7 @@ static void MX_TIM2_Init(void)
   /* USER CODE END TIM2_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_IC_InitTypeDef sConfigIC = {0};
 
@@ -284,6 +280,14 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_RESET;
+  sSlaveConfig.InputTrigger = TIM_TS_TI1FP1;
+  sSlaveConfig.TriggerPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sSlaveConfig.TriggerFilter = 0;
+  if (HAL_TIM_SlaveConfigSynchro(&htim2, &sSlaveConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
@@ -295,6 +299,12 @@ static void MX_TIM2_Init(void)
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
   sConfigIC.ICFilter = 0;
   if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -442,7 +452,6 @@ void Process_Command(char *cmd)
 
         width_count = 0;
         last_width_ticks = 0;
-        waiting_falling = 0;
 
         acquisition_duration_ms = (uint32_t)seconds * 1000UL;
         acquisition_start_tick = HAL_GetTick();
@@ -451,9 +460,10 @@ void Process_Command(char *cmd)
 
         __enable_irq();
 
-        __HAL_TIM_SET_CAPTUREPOLARITY(&htim2,TIM_CHANNEL_1,TIM_INPUTCHANNELPOLARITY_RISING);
-
-        sprintf(msg, "Acquisition started for %d s.\r\n",seconds);
+        sprintf(msg,
+                "Acquisition started for %d s. Buffer size=%d\r\n",
+                seconds,
+                WIDTH_BUF_SIZE);
 
         Uart_SendString(msg);
     }
@@ -491,83 +501,13 @@ void Process_Command(char *cmd)
 }
 
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1)
-    {
-        char ch = (char)uart_rx_byte;
-
-        if (uart_cmd_ready == 0)
-        {
-            if (ch == '\r')
-            {
-
-            }
-            else if (ch == '\n')
-            {
-                uart_rx_buf[uart_rx_index] = '\0';
-
-                strcpy(uart_cmd_buf, uart_rx_buf);
-
-                uart_rx_index = 0;
-                uart_cmd_ready = 1;
-            }
-            else
-            {
-                if (uart_rx_index < UART_CMD_BUF_SIZE - 1)
-                {
-                    uart_rx_buf[uart_rx_index] = ch;
-                    uart_rx_index++;
-                }
-                else
-                {
-                    uart_rx_index = 0;
-                }
-            }
-        }
-
-        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
-    }
-}
-
-
-/* TIM2 输入 */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
     {
-        if (waiting_falling == 0)
-        {
-            ic_rise = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-            waiting_falling = 1;
+        uint16_t width_ticks = (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim,
-                                          TIM_CHANNEL_1,
-                                          TIM_INPUTCHANNELPOLARITY_FALLING);
-        }
-        else
-        {
-
-            ic_fall = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-
-            uint32_t width_ticks_32;
-
-            if (ic_fall >= ic_rise)
-            {
-                width_ticks_32 = ic_fall - ic_rise;
-            }
-            else
-            {
-                width_ticks_32 = (65536UL - ic_rise) + ic_fall;
-            }
-
-            Save_Width_Ticks((uint16_t)width_ticks_32);
-
-            waiting_falling = 0;
-
-
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
-        }
+        Save_Width_Ticks(width_ticks);
     }
 }
 
