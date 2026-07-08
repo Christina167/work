@@ -51,7 +51,7 @@ DMA_HandleTypeDef hdma_usart1_rx;
 /* USER CODE BEGIN PV */
 
 #define TIM2_CLK_HZ        72000000UL
-#define WIDTH_BUF_SIZE     4096
+#define WIDTH_BUF_SIZE     8192
 #define UART_CMD_BUF_SIZE  64
 
 
@@ -73,6 +73,10 @@ volatile uint16_t width_buf[WIDTH_BUF_SIZE];
 volatile uint32_t width_count = 0;
 volatile uint8_t acquisition_on = 0;
 
+volatile uint32_t width_total_count = 0;
+volatile uint32_t width_write_index = 0;
+volatile uint8_t width_buf_overwritten = 0;
+
 uint32_t acquisition_start_tick = 0;
 uint32_t acquisition_duration_ms = 0;
 
@@ -91,6 +95,9 @@ volatile uint8_t rise_valid = 0;
 /* TIM1_ETR */
 volatile uint32_t etr_overflow = 0;
 volatile uint32_t etr_count_latched = 0;
+volatile uint8_t width_buf_full = 0;
+
+
 
 /* USER CODE END PV */
 
@@ -155,7 +162,7 @@ int main(void)
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 
-  Uart_SendString("Usage: start_n (n seconds, up to 4096 pulses), dump (export data)\r\n\r\n");
+  Uart_SendString("Usage: start_n (n seconds, up to latest 8192 pulses), dump (export data)\r\n\r\n");
 
   /* USER CODE END 2 */
 
@@ -182,19 +189,23 @@ int main(void)
     }
     if (acquisition_done)
     {
-        char msg[96];
+        char msg[128];
 
         if (acquisition_done == 1)
         {
-            sprintf(msg, "Acquisition finished. N=%lu\r\n", width_count);
-        }
-        else if (acquisition_done == 2)
-        {
-            sprintf(msg, "Buffer full. Acquisition stopped. N=%lu\r\n", width_count);
+            sprintf(msg,
+                    "Acquisition finished. N=%lu,N_SAVED=%lu,ETR_COUNT=%lu\r\n",
+                    width_total_count,
+                    width_count,
+                    etr_count_latched);
         }
         else
         {
-            sprintf(msg, "Acquisition stopped. N=%lu\r\n", width_count);
+            sprintf(msg,
+                    "Acquisition stopped. N=%lu,N_SAVED=%lu,ETR_COUNT=%lu\r\n",
+                    width_total_count,
+                    width_count,
+                    etr_count_latched);
         }
 
         acquisition_done = 0;
@@ -477,13 +488,9 @@ static uint32_t Get_ETR_Count(void)
 
 static void Stop_Acquisition(uint8_t reason)
 {
-    if (acquisition_on)
-    {
-        acquisition_on = 0;
-    }
+    acquisition_on = 0;
 
-    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
-    __HAL_TIM_DISABLE(&htim1);
+    HAL_TIM_Base_Stop_IT(&htim1);
 
     etr_count_latched = Get_ETR_Count();
     acquisition_done = reason;
@@ -495,23 +502,30 @@ static void Save_Width_Ticks(uint16_t width_ticks)
 
     if (acquisition_on)
     {
+        width_total_count++;
+
+        width_buf[width_write_index] = width_ticks;
+
+        width_write_index++;
+        if (width_write_index >= WIDTH_BUF_SIZE)
+        {
+            width_write_index = 0;
+        }
+
         if (width_count < WIDTH_BUF_SIZE)
         {
-            width_buf[width_count] = width_ticks;
             width_count++;
         }
         else
         {
-            Stop_Acquisition(2);
+            width_buf_overwritten = 1;
         }
     }
 }
-
 /* 命令处理 */
 void Process_Command(char *cmd)
 {
     char msg[128];
-
     if (strncmp(cmd, "start_", 6) == 0)
     {
         int seconds = atoi(&cmd[6]);
@@ -522,19 +536,22 @@ void Process_Command(char *cmd)
             return;
         }
 
-
-        __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
-        __HAL_TIM_DISABLE(&htim1);
+        HAL_TIM_Base_Stop_IT(&htim1);
 
         __disable_irq();
 
         width_count = 0;
+        width_total_count = 0;
+        width_write_index = 0;
+        width_buf_overwritten = 0;
+
         last_width_ticks = 0;
         rise_ccr1 = 0;
         rise_valid = 0;
 
         etr_overflow = 0;
         etr_count_latched = 0;
+
         __HAL_TIM_SET_COUNTER(&htim1, 0);
         __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
 
@@ -545,31 +562,65 @@ void Process_Command(char *cmd)
 
         __enable_irq();
 
-        HAL_TIM_Base_Start_IT(&htim1);
+        if (HAL_TIM_Base_Start_IT(&htim1) != HAL_OK)
+        {
+            acquisition_on = 0;
+            Uart_SendString("ERROR: TIM1_ETR start failed\r\n");
+            return;
+        }
 
         sprintf(msg, "Acquisition started for %d s.\r\n", seconds);
         Uart_SendString(msg);
     }
     else if (strcmp(cmd, "dump") == 0)
     {
-        acquisition_on = 0;
-
-        uint32_t n;
+        uint32_t n_saved;
+        uint32_t n_total;
         uint32_t etr_n;
+        uint32_t write_index;
+        uint8_t overwritten;
+
+        if (acquisition_on)
+        {
+            Stop_Acquisition(3);
+        }
 
         __disable_irq();
-        n = width_count;
+        n_saved = width_count;
+        n_total = width_total_count;
         etr_n = etr_count_latched;
+        write_index = width_write_index;
+        overwritten = width_buf_overwritten;
         __enable_irq();
 
-        sprintf(msg, "N=%lu,TIMCLK=%lu,ETR_COUNT=%lu\r\n", n, TIM2_CLK_HZ, etr_n);
+        sprintf(msg,
+                "N=%lu,N_SAVED=%lu,TIMCLK=%lu,ETR_COUNT=%lu.\r\n",
+                n_total,
+                n_saved,
+                TIM2_CLK_HZ,
+                etr_n);
         Uart_SendString(msg);
 
         Uart_SendString("index,width_ticks,width_ns\r\n");
 
-        for (uint32_t i = 0; i < n; i++)
+        for (uint32_t i = 0; i < n_saved; i++)
         {
-            uint16_t ticks = width_buf[i];
+            uint32_t buf_index;
+
+            if (overwritten)
+            {
+                buf_index = write_index + i;
+                if (buf_index >= WIDTH_BUF_SIZE)
+                {
+                    buf_index -= WIDTH_BUF_SIZE;
+                }
+            }
+            else
+            {
+                buf_index = i;
+            }
+
+            uint16_t ticks = width_buf[buf_index];
             uint32_t ns = Ticks_To_Ns(ticks);
 
             sprintf(msg, "%lu,%u,%lu\r\n", i, ticks, ns);
@@ -578,13 +629,7 @@ void Process_Command(char *cmd)
 
         Uart_SendString("END\r\n");
     }
-    else
-    {
-        sprintf(msg, "ERROR: %s\r\n", cmd);
-        Uart_SendString(msg);
-    }
 }
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
