@@ -1,14 +1,19 @@
 import argparse
 import csv
+import json
 import re
 import threading
 import time
 import webbrowser
 from pathlib import Path
 
-import serial
 import numpy as np
 import matplotlib.pyplot as plt
+
+try:
+    import serial
+except Exception:
+    serial = None
 
 try:
     from scipy.optimize import curve_fit
@@ -16,38 +21,8 @@ try:
 except Exception:
     SCIPY_OK = False
 
-
 FWHM_FACTOR = 2.354820045
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="STM32 live pulse width tick histogram analyzer with ROI Gaussian fit")
-    parser.add_argument("--port", default="COM6", help="Serial port, e.g. COM6")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
-    parser.add_argument("--timeout", type=float, default=3.0, help="Serial timeout in seconds")
-    parser.add_argument("--cycle-time", type=int, default=1, help="Acquisition time per cycle in seconds")
-    parser.add_argument("--max-cycles", type=int, default=None, help="Optional maximum number of cycles. Default: run until stop.")
-    parser.add_argument("--verbose-dump", action="store_true", help="Print every width row received from STM32.")
-    parser.add_argument("--no-live-plot", action="store_true", help="Do not show live plot; only save final figures.")
-    parser.add_argument("--out", default="width_live_data.csv", help="Output CSV filename")
-    parser.add_argument("--fig-prefix", default="width_live", help="Output figure filename prefix")
-    parser.add_argument("--bins-ns", type=int, default=80, help="Bin count for final ns histogram")
-    parser.add_argument("--tick-min", type=int, default=None, help="Optional tick histogram lower limit")
-    parser.add_argument("--tick-max", type=int, default=None, help="Optional tick histogram upper limit")
-    return parser.parse_args()
-
-
-def print_params(args):
-    print("========== 实时采集参数 ==========")
-    print(f"串口       : {args.port}")
-    print(f"波特率     : {args.baud}")
-    print(f"每轮采集   : {args.cycle_time} s")
-    if args.max_cycles is None:
-        print("停止方式   : 在此窗口输入 stop 后回车")
-    else:
-        print(f"最大轮数   : {args.max_cycles}")
-    print("实时图     : tick 直方图")
-    print()
+DEFAULT_TIMCLK = 72_000_000
 
 
 def safe_decode(raw):
@@ -64,175 +39,271 @@ def parse_int_field(line, name):
 
 
 def wait_until_finished(ser, max_wait_s):
-    start_time = time.time()
-    while time.time() - start_time < max_wait_s:
+    t0 = time.time()
+    while time.time() - t0 < max_wait_s:
         line = safe_decode(ser.readline())
         if not line:
             continue
         print(line)
-        if ("Acquisition finished" in line or
-            "Acquisition stopped" in line or
-            "Buffer full" in line):
+        if "Acquisition finished" in line or "Acquisition stopped" in line:
             return
     raise TimeoutError("等待采集完成超时")
 
 
 def read_dump(ser, verbose_dump=False):
-    metadata = {
-        "n_total": None,
-        "n_saved_reported": None,
-        "timclk": None,
-        "etr_count": None,
-        "buf_overwritten": None,
-    }
+    """当前 STM32 dump 格式：
+    N=223,N_SAVED=223,TIMCLK=72000000,ETR_COUNT=223.
+    index,width_ticks,width_ns
+    0,169,2347
+    END
+    """
+    meta = {"n_total": None, "n_saved_reported": None, "timclk": None, "etr_count": None}
     rows = []
-    reading_table = False
-
+    reading = False
     while True:
         line = safe_decode(ser.readline())
         if not line:
             continue
-
-        if verbose_dump or not reading_table or line == "END":
+        if verbose_dump or not reading or line == "END":
             print(line)
-
         if line.startswith("N=") and "TIMCLK=" in line:
-            metadata["n_total"] = parse_int_field(line, "N")
-            metadata["n_saved_reported"] = parse_int_field(line, "N_SAVED")
-            metadata["timclk"] = parse_int_field(line, "TIMCLK")
-            metadata["etr_count"] = parse_int_field(line, "ETR_COUNT")
-            metadata["buf_overwritten"] = parse_int_field(line, "BUF_OVERWRITTEN")
+            meta["n_total"] = parse_int_field(line, "N")
+            meta["n_saved_reported"] = parse_int_field(line, "N_SAVED")
+            meta["timclk"] = parse_int_field(line, "TIMCLK")
+            meta["etr_count"] = parse_int_field(line, "ETR_COUNT")
             continue
-
-        if line.startswith("WIDTH_TOTAL="):
-            metadata["n_total"] = parse_int_field(line, "WIDTH_TOTAL")
-            metadata["buf_overwritten"] = parse_int_field(line, "BUF_OVERWRITTEN")
-            continue
-
         if line == "index,width_ticks,width_ns":
-            reading_table = True
+            reading = True
             continue
-
         if line == "END":
             break
-
-        if reading_table:
-            parts = line.split(",")
-            if len(parts) != 3:
+        if reading:
+            p = line.split(",")
+            if len(p) != 3:
                 continue
             try:
-                rows.append({
-                    "index": int(parts[0]),
-                    "width_ticks": int(parts[1]),
-                    "width_ns": int(parts[2]),
-                })
+                rows.append({"index": int(p[0]), "width_ticks": int(p[1]), "width_ns": float(p[2])})
             except ValueError:
                 continue
-
-    return metadata, rows
-
-
-def save_combined_csv(cycle_rows, cycle_infos, output_file):
-    path = Path(output_file)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["cycle_summary"])
-        writer.writerow(["cycle", "duration_s", "etr_count", "tim2_n_total",
-                         "n_saved_reported", "n_parsed", "buf_overwritten"])
-        for info in cycle_infos:
-            writer.writerow([
-                info["cycle"],
-                info["duration_s"],
-                info.get("etr_count"),
-                info.get("n_total"),
-                info.get("n_saved_reported"),
-                info.get("n_parsed"),
-                info.get("buf_overwritten"),
-            ])
-
-        writer.writerow([])
-        writer.writerow(["width_rows"])
-        writer.writerow(["cycle", "index", "width_ticks", "width_ns"])
-        for row in cycle_rows:
-            writer.writerow([row["cycle"], row["index"], row["width_ticks"], row["width_ns"]])
-    return path
+    return meta, rows
 
 
-def tick_hist_edges(ticks, tick_min=None, tick_max=None):
+def ensure_dir(p):
+    p = Path(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def paths_for(out_dir, name):
+    out_dir = ensure_dir(out_dir)
+    base = out_dir / name
+    return {
+        "csv": base.with_suffix(".csv"),
+        "tick_html": base.with_name(base.name + "_tick_histogram.html"),
+        "tick_csv": base.with_name(base.name + "_tick_histogram.csv"),
+        "ns_html": base.with_name(base.name + "_ns_histogram.html"),
+        "ns_csv": base.with_name(base.name + "_ns_histogram.csv"),
+        "fit_all": base.with_name(base.name + "_fit_results.txt"),
+    }
+
+
+def save_combined_csv(cycle_rows, cycle_infos, csv_file):
+    with Path(csv_file).open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["cycle_summary"])
+        w.writerow(["cycle", "duration_s", "etr_count", "tim2_n_total", "n_saved_reported", "n_parsed", "timclk"])
+        for i in cycle_infos:
+            w.writerow([i["cycle"], i["duration_s"], i["etr_count"], i["n_total"], i["n_saved_reported"], i["n_parsed"], i["timclk"]])
+        w.writerow([])
+        w.writerow(["width_rows"])
+        w.writerow(["cycle", "index", "width_ticks", "width_ns"])
+        for r in cycle_rows:
+            w.writerow([r["cycle"], r["index"], r["width_ticks"], r["width_ns"]])
+    return Path(csv_file)
+
+
+def load_latest_csv(csv_file):
+    """只读取本脚本最新 CSV。若旧 CSV 没有 timclk 列，默认 72 MHz。"""
+    csv_file = Path(csv_file)
+    if not csv_file.exists():
+        raise FileNotFoundError(f"找不到 CSV：{csv_file}")
+    cycle_infos, rows = [], []
+    mode, header = None, None
+    with csv_file.open("r", newline="", encoding="utf-8") as f:
+        for r in csv.reader(f):
+            if not r or all(x.strip() == "" for x in r):
+                continue
+            first = r[0].strip()
+            if first == "cycle_summary":
+                mode, header = "cycle_summary", None
+                continue
+            if first == "width_rows":
+                mode, header = "width_rows", None
+                continue
+            if mode == "cycle_summary":
+                if header is None:
+                    header = [x.strip() for x in r]
+                    continue
+                item = dict(zip(header, r))
+                cycle_infos.append({
+                    "cycle": int(item["cycle"]),
+                    "duration_s": float(item["duration_s"]),
+                    "etr_count": int(float(item["etr_count"])),
+                    "n_total": int(float(item["tim2_n_total"])),
+                    "n_saved_reported": int(float(item["n_saved_reported"])),
+                    "n_parsed": int(float(item["n_parsed"])),
+                    "timclk": int(float(item.get("timclk") or DEFAULT_TIMCLK)),
+                })
+                continue
+            if mode == "width_rows":
+                if header is None:
+                    header = [x.strip() for x in r]
+                    continue
+                item = dict(zip(header, r))
+                rows.append({
+                    "cycle": int(item["cycle"]),
+                    "index": int(item["index"]),
+                    "width_ticks": int(float(item["width_ticks"])),
+                    "width_ns": float(item["width_ns"]),
+                })
+    if not rows:
+        raise ValueError("CSV 中没有 width_rows。请确认文件由新版 analyze.py 生成。")
+    ticks = np.array([r["width_ticks"] for r in rows], dtype=int)
+    ns = np.array([r["width_ns"] for r in rows], dtype=float)
+    timclk = cycle_infos[0]["timclk"] if cycle_infos else DEFAULT_TIMCLK
+    return ticks, ns, cycle_infos, timclk
+
+
+def tick_histogram(ticks, tick_min=None, tick_max=None):
     if len(ticks) == 0:
-        return np.array([0, 1], dtype=float)
+        return np.array([], dtype=int), np.array([], dtype=int)
     lo = int(np.min(ticks)) if tick_min is None else int(tick_min)
     hi = int(np.max(ticks)) if tick_max is None else int(tick_max)
-    if hi <= lo:
-        hi = lo + 1
-    return np.arange(lo - 0.5, hi + 1.5, 1.0)
+    if hi < lo:
+        lo, hi = hi, lo
+    centers = np.arange(lo, hi + 1, dtype=int)
+    counts = np.zeros(len(centers), dtype=int)
+    vals, nums = np.unique(ticks[(ticks >= lo) & (ticks <= hi)], return_counts=True)
+    for v, n in zip(vals, nums):
+        counts[int(v - lo)] = int(n)
+    return centers, counts
 
 
-def print_running_summary(cycle_infos, total_width_samples):
-    total_duration = sum(info["duration_s"] for info in cycle_infos)
-    total_etr = sum(info.get("etr_count") or 0 for info in cycle_infos)
-    last = cycle_infos[-1]
-    avg_etr_cps = total_etr / total_duration if total_duration > 0 else 0.0
-    print(
-        f"[第 {last['cycle']} 轮] "
-        f"ETR={last.get('etr_count')}, TIM2_N={last.get('n_total')}, saved={last.get('n_parsed')}, "
-        f"累计ETR={total_etr}, 平均ETR CPS={avg_etr_cps:.2f}, "
-        f"累计脉宽样本={total_width_samples}"
+def write_plotly_hist_html(x, y, html_file, title, xlabel, x_unit="", notes=None, fit=None, vlines=None):
+    """输出可交互 HTML。鼠标悬停可读坐标；不生成 PNG。"""
+    if notes is None:
+        notes = []
+    if vlines is None:
+        vlines = []
+    traces = [{
+        "type": "bar",
+        "x": list(map(float, x)),
+        "y": list(map(float, y)),
+        "name": "histogram",
+        "hovertemplate": f"%{{x}} {x_unit}<br>counts=%{{y}}<extra></extra>",
+    }]
+    if fit is not None:
+        traces.append({
+            "type": "scatter",
+            "mode": "lines",
+            "x": list(map(float, fit["x"])),
+            "y": list(map(float, fit["y"])),
+            "name": fit.get("name", "fit"),
+            "line": {"color": "red", "width": 2},
+            "hovertemplate": f"x=%{{x:.3f}} {x_unit}<br>fit=%{{y:.2f}}<extra></extra>",
+        })
+    shapes = []
+    annotations = []
+    for vl in vlines:
+        shapes.append({
+            "type": "line",
+            "xref": "x", "yref": "paper",
+            "x0": float(vl["x"]), "x1": float(vl["x"]),
+            "y0": 0, "y1": 1,
+            "line": {"color": vl.get("color", "black"), "width": 1.5, "dash": "dash"},
+        })
+        annotations.append({
+            "x": float(vl["x"]), "y": 1.02, "xref": "x", "yref": "paper",
+            "text": vl.get("label", ""), "showarrow": False,
+            "font": {"size": 12, "color": vl.get("color", "black")},
+        })
+    layout = {
+        "title": title,
+        "xaxis": {"title": xlabel, "showspikes": True, "spikemode": "across", "spikesnap": "cursor"},
+        "yaxis": {"title": "Counts"},
+        "hovermode": "closest",
+        "bargap": 0.05,
+        "shapes": shapes,
+        "annotations": annotations,
+    }
+    body_notes = "".join(f"<li>{n}</li>" for n in notes)
+    html_text = f'''<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>{title}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script></head>
+<body style="font-family:Arial,'Microsoft YaHei',sans-serif;margin:20px;">
+<h2>{title}</h2>
+<ul>{body_notes}</ul>
+<div id="chart" style="width:1200px;height:680px;"></div>
+<script>
+const traces = {json.dumps(traces, ensure_ascii=False)};
+const layout = {json.dumps(layout, ensure_ascii=False)};
+Plotly.newPlot('chart', traces, layout, {{responsive:true, scrollZoom:true}});
+</script>
+</body></html>'''
+    Path(html_file).write_text(html_text, encoding="utf-8")
+    return Path(html_file)
+
+
+def save_tick_outputs(ticks, html_file, csv_file, tick_min=None, tick_max=None, open_html=False):
+    centers, counts = tick_histogram(ticks, tick_min, tick_max)
+    with Path(csv_file).open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["tick", "count"])
+        for x, y in zip(centers, counts):
+            w.writerow([int(x), int(y)])
+    out = write_plotly_hist_html(centers, counts, html_file, f"Pulse Width Distribution in Ticks, N={len(ticks)}", "Pulse width / tick", "tick")
+    if open_html:
+        webbrowser.open(str(out))
+    return out, Path(csv_file)
+
+
+def save_ns_outputs_from_ticks(ticks, html_file, csv_file, tick_ns, tick_min=None, tick_max=None, open_html=False):
+    centers_tick, counts = tick_histogram(ticks, tick_min, tick_max)
+    centers_ns = centers_tick.astype(float) * tick_ns
+    with Path(csv_file).open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["width_ns_center", "tick", "count"])
+        for ns, t, c in zip(centers_ns, centers_tick, counts):
+            w.writerow([float(ns), int(t), int(c)])
+    out = write_plotly_hist_html(
+        centers_ns, counts, html_file,
+        f"Pulse Width Distribution in ns, N={len(ticks)}",
+        "Pulse width / ns", "ns",
+        notes=[f"由 tick 直方图按 1 tick = {tick_ns:.6f} ns 换算；没有重新用任意 ns bin 分箱，因此不会引入额外锯齿。"],
     )
-    if last.get("etr_count") is not None and last.get("n_total") is not None:
-        diff = last["etr_count"] - last["n_total"]
-        if diff != 0:
-            print(f"  注意：本轮 ETR-TIM2 差值 = {diff}")
+    if open_html:
+        webbrowser.open(str(out))
+    return out, Path(csv_file)
 
 
-def print_final_statistics(ticks, ns, cycle_infos):
-    total_duration = sum(info["duration_s"] for info in cycle_infos)
-    total_etr = sum(info.get("etr_count") or 0 for info in cycle_infos)
-    total_tim2 = sum(info.get("n_total") or 0 for info in cycle_infos)
-
-    print("\n========== 最终采集结果 ==========")
-    print(f"累计时间       : {total_duration:.0f} s")
-    print(f"累计 ETR_COUNT : {total_etr}")
-    print(f"平均 ETR CPS   : {total_etr / total_duration:.2f} CPS" if total_duration > 0 else "平均 ETR CPS   : 0 CPS")
-    print(f"累计 TIM2_N    : {total_tim2}")
-    print(f"平均 TIM2 CPS  : {total_tim2 / total_duration:.2f} CPS" if total_duration > 0 else "平均 TIM2 CPS  : 0 CPS")
-    print(f"累计脉宽样本   : {len(ticks)}")
-    print(f"ETR-TIM2差值   : {total_etr - total_tim2}")
-
-    if len(ticks) == 0:
-        return
-
-    print("\n========== 脉宽统计：tick ==========")
-    print(f"平均值         : {np.mean(ticks):.2f} tick")
-    print(f"中位数         : {np.median(ticks):.2f} tick")
-    print(f"标准差         : {np.std(ticks, ddof=1) if len(ticks) >= 2 else 0.0:.2f} tick")
-    print(f"最小值         : {np.min(ticks)} tick")
-    print(f"最大值         : {np.max(ticks)} tick")
-
-    print("\n========== 脉宽统计：ns ==========")
-    print(f"平均值         : {np.mean(ns):.2f} ns")
-    print(f"中位数         : {np.median(ns):.2f} ns")
-    print(f"标准差         : {np.std(ns, ddof=1) if len(ns) >= 2 else 0.0:.2f} ns")
-    print(f"最小值         : {np.min(ns):.2f} ns")
-    print(f"最大值         : {np.max(ns):.2f} ns")
-
-
-def init_live_plot(args):
-    if args.no_live_plot:
+def init_live_plot(no_live_plot):
+    if no_live_plot:
         return None, None
     plt.ion()
     fig, ax = plt.subplots(figsize=(10, 5))
     return fig, ax
 
 
-def update_live_tick_histogram(fig, ax, ticks, args, cycle_count):
-    if args.no_live_plot or fig is None or ax is None or len(ticks) == 0:
+def update_live_plot(fig, ax, ticks, tick_min=None, tick_max=None):
+    if fig is None or ax is None or len(ticks) == 0:
         return
+    centers, counts = tick_histogram(ticks, tick_min, tick_max)
     ax.clear()
-    ax.hist(ticks, bins=tick_hist_edges(ticks, args.tick_min, args.tick_max))
+    ax.bar(centers, counts, width=0.9)
     ax.set_xlabel("Pulse width / tick")
     ax.set_ylabel("Counts")
-    ax.set_title(f"Live Tick Distribution, cycles={cycle_count}, N={len(ticks)}")
+    ax.set_title(f"Live Tick Distribution, N={len(ticks)}")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.canvas.draw()
@@ -240,36 +311,141 @@ def update_live_tick_histogram(fig, ax, ticks, args, cycle_count):
     plt.pause(0.01)
 
 
-def save_final_histograms(ticks, ns, args):
-    if len(ticks) == 0:
-        return None, None
+def print_summary(ticks, ns, cycle_infos):
+    total_time = sum(i["duration_s"] for i in cycle_infos)
+    total_etr = sum(i["etr_count"] for i in cycle_infos)
+    total_tim2 = sum(i["n_total"] for i in cycle_infos)
+    print("\n========== 文件/采集统计 ==========")
+    print(f"累计时间       : {total_time:.0f} s")
+    print(f"累计 ETR_COUNT : {total_etr}")
+    print(f"平均 ETR CPS   : {total_etr / total_time:.2f} CPS" if total_time > 0 else "平均 ETR CPS   : 0 CPS")
+    print(f"累计 TIM2_N    : {total_tim2}")
+    print(f"平均 TIM2 CPS  : {total_tim2 / total_time:.2f} CPS" if total_time > 0 else "平均 TIM2 CPS  : 0 CPS")
+    print(f"ETR-TIM2差值   : {total_etr - total_tim2}")
+    print(f"脉宽样本数     : {len(ticks)}")
+    print("\n========== tick 统计 ==========")
+    print(f"平均值         : {np.mean(ticks):.2f} tick")
+    print(f"中位数         : {np.median(ticks):.2f} tick")
+    print(f"标准差         : {np.std(ticks, ddof=1) if len(ticks) >= 2 else 0.0:.2f} tick")
+    print(f"最小值         : {np.min(ticks)} tick")
+    print(f"最大值         : {np.max(ticks)} tick")
+    print("\n========== ns 统计 ==========")
+    print(f"平均值         : {np.mean(ns):.2f} ns")
+    print(f"中位数         : {np.median(ns):.2f} ns")
+    print(f"标准差         : {np.std(ns, ddof=1) if len(ns) >= 2 else 0.0:.2f} ns")
+    print(f"最小值         : {np.min(ns):.2f} ns")
+    print(f"最大值         : {np.max(ns):.2f} ns")
 
-    tick_fig = Path(f"{args.fig_prefix}_tick_histogram.png")
-    ns_fig = Path(f"{args.fig_prefix}_ns_histogram.png")
 
-    plt.ioff()
+def gaussian_const(x, amp, mu, sigma, bg):
+    return bg + amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
-    plt.figure(figsize=(10, 5))
-    plt.hist(ticks, bins=tick_hist_edges(ticks, args.tick_min, args.tick_max))
-    plt.xlabel("Pulse width / tick")
-    plt.ylabel("Counts")
-    plt.title(f"Pulse Width Distribution in Ticks, N={len(ticks)}")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(tick_fig, dpi=200)
-    plt.close()
 
-    plt.figure(figsize=(10, 5))
-    plt.hist(ns, bins=args.bins_ns)
-    plt.xlabel("Pulse width / ns")
-    plt.ylabel("Counts")
-    plt.title(f"Pulse Width Distribution in ns, N={len(ns)}")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(ns_fig, dpi=200)
-    plt.close()
+def roi_hist(ticks, lo, hi):
+    roi = ticks[(ticks >= lo) & (ticks <= hi)]
+    centers = np.arange(lo, hi + 1, dtype=float)
+    counts = np.zeros(len(centers), dtype=float)
+    vals, nums = np.unique(roi, return_counts=True)
+    for v, n in zip(vals, nums):
+        if lo <= v <= hi:
+            counts[int(v - lo)] = n
+    return roi, centers, counts
 
-    return tick_fig, ns_fig
+
+def fit_single_roi(ticks, lo, hi, tick_ns, out_dir, name):
+    if not SCIPY_OK:
+        raise RuntimeError("未安装 scipy，无法做高斯拟合。请先运行：pip install scipy")
+    if hi < lo:
+        lo, hi = hi, lo
+    roi, x, y = roi_hist(ticks, lo, hi)
+    if len(roi) < 10:
+        print("ROI 内事件太少，无法可靠拟合。")
+        return None
+    bg0 = float(np.percentile(y, 10))
+    amp0 = max(float(np.max(y) - bg0), 1.0)
+    mu0 = float(x[np.argmax(y)])
+    sigma0 = max(float(np.std(roi, ddof=1)), 1.0)
+    popt, _ = curve_fit(
+        gaussian_const, x, y,
+        p0=[amp0, mu0, sigma0, bg0],
+        bounds=([0, lo, 0.5, 0], [np.inf, hi, max(hi - lo, 1), np.inf]),
+        maxfev=20000,
+    )
+    amp, mu, sigma, bg = popt
+    sigma = abs(float(sigma))
+    fwhm_tick = FWHM_FACTOR * sigma
+    left_half = float(mu - fwhm_tick / 2)
+    right_half = float(mu + fwhm_tick / 2)
+    resolution = fwhm_tick / mu * 100 if mu != 0 else float("nan")
+    mu_ns = float(mu * tick_ns)
+    sigma_ns = float(sigma * tick_ns)
+    fwhm_ns = float(fwhm_tick * tick_ns)
+    lines = [
+        f"--- 单高斯拟合 ROI=[{lo},{hi}] ---",
+        f"峰位           : {mu:.3f} tick = {mu_ns:.2f} ns",
+        f"σ              : {sigma:.3f} tick = {sigma_ns:.2f} ns",
+        f"FWHM           : {fwhm_tick:.3f} tick = {fwhm_ns:.2f} ns",
+        f"相对分辨率     : {resolution:.2f} %",
+    ]
+    print()
+    print("\n".join(lines))
+    dense_x = np.linspace(lo, hi, 1000)
+    dense_y = gaussian_const(dense_x, *popt)
+    out_dir = ensure_dir(out_dir)
+    fit_html = out_dir / f"{name}_roi_{lo}_{hi}_fit.html"
+    fit_txt = out_dir / f"{name}_roi_{lo}_{hi}_fit.txt"
+    all_fit_txt = out_dir / f"{name}_fit_results.txt"
+    notes = [
+        f"ROI = [{lo}, {hi}] tick",
+        f"Peak = {mu:.3f} tick = {mu_ns:.2f} ns",
+        f"Sigma = {sigma:.3f} tick = {sigma_ns:.2f} ns",
+        f"FWHM = {fwhm_tick:.3f} tick = {fwhm_ns:.2f} ns",
+        f"Resolution = {resolution:.2f} %",
+    ]
+    write_plotly_hist_html(
+        x, y, fit_html,
+        f"Gaussian Fit: {name}, ROI=[{lo},{hi}]",
+        "Pulse width / tick", "tick",
+        notes=notes,
+        fit={"x": dense_x.tolist(), "y": dense_y.tolist(), "name": "Gaussian + constant background"},
+        vlines=[
+            {"x": float(mu), "label": f"Peak {mu:.2f}", "color": "red"},
+            {"x": left_half, "label": f"FWHM-L {left_half:.2f}", "color": "green"},
+            {"x": right_half, "label": f"FWHM-R {right_half:.2f}", "color": "green"},
+        ],
+    )
+    fit_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with all_fit_txt.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
+    print(f"拟合图已保存至 {fit_html}")
+    print(f"拟合结果已保存至 {fit_txt}")
+    webbrowser.open(str(fit_html))
+    return mu, sigma, fwhm_tick, resolution
+
+
+def roi_loop(ticks, tick_ns, out_dir, name, make_ns_callback=None):
+    print("\n========== ROI 高斯拟合 ==========")
+    print("命令：")
+    print("  fit  起始tick  结束tick       单高斯拟合")
+    print("  ns                          生成 ns 横轴直方图")
+    print("  done                        结束")
+    print("提示：HTML 图可用鼠标查看坐标，先人工看峰位再选 ROI。")
+    while True:
+        cmd = input("ROI> ").strip().lower()
+        if cmd in {"done", "q", "quit", "exit", ""}:
+            break
+        if cmd == "ns":
+            if make_ns_callback:
+                make_ns_callback()
+            continue
+        p = cmd.split()
+        if len(p) != 3 or p[0] != "fit":
+            print("格式错误。示例：fit 140 210；生成 ns 图：ns；结束：done")
+            continue
+        try:
+            fit_single_roi(ticks, int(p[1]), int(p[2]), tick_ns, out_dir, name)
+        except Exception as e:
+            print(f"拟合失败：{e}")
 
 
 def stop_input_thread(stop_event):
@@ -284,329 +460,159 @@ def stop_input_thread(stop_event):
             return
 
 
-def gaussian_const(x, amp, mu, sigma, bg):
-    return bg + amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
-
-
-def double_gaussian_const(x, amp1, mu1, sigma1, amp2, mu2, sigma2, bg):
-    return (
-        bg
-        + amp1 * np.exp(-0.5 * ((x - mu1) / sigma1) ** 2)
-        + amp2 * np.exp(-0.5 * ((x - mu2) / sigma2) ** 2)
-    )
-
-
-def roi_histogram(ticks, lo, hi):
-    roi_ticks = ticks[(ticks >= lo) & (ticks <= hi)]
-    centers = np.arange(lo, hi + 1, dtype=float)
-    counts = np.zeros(len(centers), dtype=float)
-    if len(roi_ticks) > 0:
-        values, cnts = np.unique(roi_ticks, return_counts=True)
-        for v, c in zip(values, cnts):
-            if lo <= v <= hi:
-                counts[int(v - lo)] = c
-    return roi_ticks, centers, counts
-
-
-def estimate_single_from_moments(roi_ticks):
-    mu = float(np.mean(roi_ticks))
-    sigma = float(np.std(roi_ticks, ddof=1)) if len(roi_ticks) >= 2 else 0.0
-    return mu, sigma
-
-
-def report_peak(label, mu_tick, sigma_tick, tick_ns):
-    fwhm_tick = FWHM_FACTOR * sigma_tick
-    mu_ns = mu_tick * tick_ns
-    sigma_ns = sigma_tick * tick_ns
-    fwhm_ns = fwhm_tick * tick_ns
-    resolution = fwhm_tick / mu_tick * 100.0 if mu_tick != 0 else float("nan")
-
-    print(f"\n--- {label} ---")
-    print(f"峰位           : {mu_tick:.3f} tick = {mu_ns:.2f} ns")
-    print(f"σ              : {sigma_tick:.3f} tick = {sigma_ns:.2f} ns")
-    print(f"FWHM           : {fwhm_tick:.3f} tick = {fwhm_ns:.2f} ns")
-    print(f"相对分辨率     : {resolution:.2f} %")
-    return {
-        "mu_tick": mu_tick,
-        "sigma_tick": sigma_tick,
-        "fwhm_tick": fwhm_tick,
-        "mu_ns": mu_ns,
-        "sigma_ns": sigma_ns,
-        "fwhm_ns": fwhm_ns,
-        "resolution_percent": resolution,
-    }
-
-
-def fit_single_roi(ticks, lo, hi, tick_ns, fig_prefix):
-    roi_ticks, x, y = roi_histogram(ticks, lo, hi)
-    if len(roi_ticks) < 10:
-        print("ROI 内事件太少，无法可靠拟合。")
-        return None
-
-    if not SCIPY_OK:
-        print("未检测到 scipy：使用 ROI 内样本均值/标准差估计。若要高斯拟合，请运行 pip install scipy。")
-        mu, sigma = estimate_single_from_moments(roi_ticks)
-        return report_peak(f"单峰估计 ROI=[{lo},{hi}]", mu, sigma, tick_ns)
-
-    bg0 = float(np.percentile(y, 10))
-    amp0 = max(float(np.max(y) - bg0), 1.0)
-    mu0 = float(x[np.argmax(y)])
-    sigma0 = max(float(np.std(roi_ticks, ddof=1)), 1.0)
-
-    lower = [0.0, lo, 0.5, 0.0]
-    upper = [np.inf, hi, max(hi - lo, 1), np.inf]
-
-    try:
-        popt, _ = curve_fit(
-            gaussian_const, x, y,
-            p0=[amp0, mu0, sigma0, bg0],
-            bounds=(lower, upper),
-            maxfev=20000,
-        )
-    except Exception as e:
-        print(f"单高斯拟合失败：{e}")
-        mu, sigma = estimate_single_from_moments(roi_ticks)
-        return report_peak(f"单峰矩估计 ROI=[{lo},{hi}]", mu, sigma, tick_ns)
-
-    amp, mu, sigma, bg = popt
-    sigma = abs(float(sigma))
-    result = report_peak(f"单高斯拟合 ROI=[{lo},{hi}]", float(mu), sigma, tick_ns)
-
-    fit_fig = Path(f"{fig_prefix}_roi_{lo}_{hi}_single_fit.png")
-    dense_x = np.linspace(lo, hi, 1000)
-    dense_y = gaussian_const(dense_x, *popt)
-
-    plt.figure(figsize=(10, 5))
-    plt.step(x, y, where="mid", label="ROI histogram")
-    plt.plot(dense_x, dense_y, label="single Gaussian + const bg")
-    plt.axvline(mu, linestyle="--", label=f"peak={mu:.2f} tick")
-    plt.xlabel("Pulse width / tick")
-    plt.ylabel("Counts")
-    plt.title(f"Single Gaussian Fit, ROI=[{lo},{hi}]")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(fit_fig, dpi=200)
-    plt.close()
-    print(f"拟合图已保存至 {fit_fig}")
-    return result
-
-
-def choose_two_initial_peaks(x, y, lo, hi):
-    sorted_idx = np.argsort(y)[::-1]
-    mu1 = float(x[sorted_idx[0]])
-    min_sep = max(3.0, (hi - lo) / 6.0)
-    mu2 = None
-    for idx in sorted_idx[1:]:
-        candidate = float(x[idx])
-        if abs(candidate - mu1) >= min_sep:
-            mu2 = candidate
-            break
-    if mu2 is None:
-        mu2 = float((lo + hi) / 2.0)
-        if mu2 <= mu1:
-            mu2 = min(float(hi), mu1 + min_sep)
-    if mu1 > mu2:
-        mu1, mu2 = mu2, mu1
-    return mu1, mu2
-
-
-def fit_double_roi(ticks, lo, hi, tick_ns, fig_prefix):
-    roi_ticks, x, y = roi_histogram(ticks, lo, hi)
-    if len(roi_ticks) < 30:
-        print("ROI 内事件太少，无法可靠双峰拟合。")
-        return None
-    if not SCIPY_OK:
-        print("双高斯拟合需要 scipy。请运行：pip install scipy")
-        return None
-
-    bg0 = float(np.percentile(y, 10))
-    mu1_0, mu2_0 = choose_two_initial_peaks(x, y, lo, hi)
-    amp_default = max(float(np.max(y) - bg0), 1.0)
-    amp1_0 = amp_default
-    amp2_0 = amp_default / 2.0
-    sigma0 = max((hi - lo) / 10.0, 1.0)
-
-    lower = [0.0, lo, 0.5, 0.0, lo, 0.5, 0.0]
-    upper = [np.inf, hi, max(hi - lo, 1), np.inf, hi, max(hi - lo, 1), np.inf]
-
-    try:
-        popt, _ = curve_fit(
-            double_gaussian_const, x, y,
-            p0=[amp1_0, mu1_0, sigma0, amp2_0, mu2_0, sigma0, bg0],
-            bounds=(lower, upper),
-            maxfev=50000,
-        )
-    except Exception as e:
-        print(f"双高斯拟合失败：{e}")
-        return None
-
-    amp1, mu1, sig1, amp2, mu2, sig2, bg = popt
-    peaks = [
-        {"amp": float(amp1), "mu": float(mu1), "sigma": abs(float(sig1))},
-        {"amp": float(amp2), "mu": float(mu2), "sigma": abs(float(sig2))},
-    ]
-    peaks.sort(key=lambda p: p["mu"])
-
-    print("\n双高斯拟合结果。注意：若两个峰间距小于约 1–2 个 σ，结果可能不唯一。")
-    r1 = report_peak("双峰-低 tick 峰", peaks[0]["mu"], peaks[0]["sigma"], tick_ns)
-    r2 = report_peak("双峰-高 tick 峰", peaks[1]["mu"], peaks[1]["sigma"], tick_ns)
-
-    separation = abs(peaks[1]["mu"] - peaks[0]["mu"])
-    avg_sigma = 0.5 * (peaks[0]["sigma"] + peaks[1]["sigma"])
-    print(f"\n峰间距         : {separation:.3f} tick = {separation * tick_ns:.2f} ns")
-    print(f"峰间距/平均σ   : {separation / avg_sigma:.2f}" if avg_sigma > 0 else "峰间距/平均σ   : nan")
-    if avg_sigma > 0 and separation / avg_sigma < 2:
-        print("警告           : 两峰严重重叠，双高斯参数相关性很强，只能作为经验分解。")
-
-    fit_fig = Path(f"{fig_prefix}_roi_{lo}_{hi}_double_fit.png")
-    dense_x = np.linspace(lo, hi, 1000)
-    y1 = peaks[0]["amp"] * np.exp(-0.5 * ((dense_x - peaks[0]["mu"]) / peaks[0]["sigma"]) ** 2)
-    y2 = peaks[1]["amp"] * np.exp(-0.5 * ((dense_x - peaks[1]["mu"]) / peaks[1]["sigma"]) ** 2)
-    total = bg + y1 + y2
-
-    plt.figure(figsize=(10, 5))
-    plt.step(x, y, where="mid", label="ROI histogram")
-    plt.plot(dense_x, total, label="double Gaussian + const bg")
-    plt.plot(dense_x, bg + y1, linestyle="--", label="component 1 + bg")
-    plt.plot(dense_x, bg + y2, linestyle="--", label="component 2 + bg")
-    plt.axvline(peaks[0]["mu"], linestyle="--", label=f"peak1={peaks[0]['mu']:.2f} tick")
-    plt.axvline(peaks[1]["mu"], linestyle="--", label=f"peak2={peaks[1]['mu']:.2f} tick")
-    plt.xlabel("Pulse width / tick")
-    plt.ylabel("Counts")
-    plt.title(f"Double Gaussian Fit, ROI=[{lo},{hi}]")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(fit_fig, dpi=200)
-    plt.close()
-    print(f"拟合图已保存至 {fit_fig}")
-    return r1, r2
-
-
-def interactive_roi_fit(ticks, tick_ns, fig_prefix):
-    if len(ticks) == 0:
-        return
-    print("\n========== ROI 高斯拟合 ==========")
-    print("输入格式：")
-    print("  fit  起始tick  结束tick       单高斯拟合，例如：fit 100 160")
-    print("  fit2 起始tick  结束tick       双高斯拟合，例如：fit2 100 200")
-    print("  done                         结束")
-    print("建议先看 tick 直方图，再按峰附近范围选 ROI。")
-
-    while True:
-        cmd = input("ROI> ").strip().lower()
-        if cmd in {"done", "q", "quit", "exit", ""}:
-            break
-
-        parts = cmd.split()
-        if len(parts) != 3 or parts[0] not in {"fit", "fit2"}:
-            print("格式错误。示例：fit 100 160 或 fit2 100 220")
-            continue
-
-        try:
-            lo = int(parts[1])
-            hi = int(parts[2])
-        except ValueError:
-            print("tick 范围必须是整数。")
-            continue
-
-        if hi < lo:
-            lo, hi = hi, lo
-
-        if parts[0] == "fit":
-            fit_single_roi(ticks, lo, hi, tick_ns, fig_prefix)
-        else:
-            fit_double_roi(ticks, lo, hi, tick_ns, fig_prefix)
-
-
-def main():
-    args = parse_args()
-    print_params(args)
-
+def run_acquire(args):
+    if serial is None:
+        raise RuntimeError("未安装 pyserial。请运行：pip install pyserial")
+    out_dir = ensure_dir(args.out_dir)
+    paths = paths_for(out_dir, args.name)
+    print("========== 采集模式 ==========")
+    print(f"串口       : {args.port}")
+    print(f"波特率     : {args.baud}")
+    print(f"每轮采集   : {args.cycle_time} s")
+    print(f"输出目录   : {out_dir}")
+    print(f"文件名     : {args.name}")
+    print("停止方式   : 输入 stop 后回车，或 Ctrl+C\n")
     stop_event = threading.Event()
-    thread = threading.Thread(target=stop_input_thread, args=(stop_event,), daemon=True)
-    thread.start()
-
-    all_rows = []
-    cycle_infos = []
-    all_ticks = []
-    all_ns = []
-    last_timclk = None
-
-    fig, ax = init_live_plot(args)
-
+    threading.Thread(target=stop_input_thread, args=(stop_event,), daemon=True).start()
+    all_rows, cycle_infos, all_ticks, all_ns = [], [], [], []
+    last_timclk = DEFAULT_TIMCLK
+    fig, ax = init_live_plot(args.no_live_plot)
     ser = serial.Serial(args.port, args.baud, timeout=args.timeout)
     ser.reset_input_buffer()
     ser.reset_output_buffer()
-
     cycle = 0
-
     try:
         while not stop_event.is_set():
             if args.max_cycles is not None and cycle >= args.max_cycles:
                 break
-
             cycle += 1
             send_cmd(ser, f"start_{args.cycle_time}")
-            wait_until_finished(ser, max_wait_s=args.cycle_time + 10)
-
+            wait_until_finished(ser, args.cycle_time + 10)
             send_cmd(ser, "dump")
-            metadata, rows = read_dump(ser, verbose_dump=args.verbose_dump)
-
-            if metadata.get("timclk"):
-                last_timclk = metadata["timclk"]
-
+            meta, rows = read_dump(ser, args.verbose_dump)
+            timclk = meta["timclk"] or DEFAULT_TIMCLK
+            last_timclk = timclk
             for row in rows:
-                all_rows.append({
-                    "cycle": cycle,
-                    "index": row["index"],
-                    "width_ticks": row["width_ticks"],
-                    "width_ns": row["width_ns"],
-                })
+                all_rows.append({"cycle": cycle, "index": row["index"], "width_ticks": row["width_ticks"], "width_ns": row["width_ns"]})
                 all_ticks.append(row["width_ticks"])
                 all_ns.append(row["width_ns"])
-
-            cycle_info = {
+            info = {
                 "cycle": cycle,
                 "duration_s": args.cycle_time,
-                "etr_count": metadata.get("etr_count"),
-                "n_total": metadata.get("n_total"),
-                "n_saved_reported": metadata.get("n_saved_reported"),
+                "etr_count": meta["etr_count"] or 0,
+                "n_total": meta["n_total"] or 0,
+                "n_saved_reported": meta["n_saved_reported"] or len(rows),
                 "n_parsed": len(rows),
-                "buf_overwritten": metadata.get("buf_overwritten"),
+                "timclk": timclk,
             }
-            cycle_infos.append(cycle_info)
-            print_running_summary(cycle_infos, len(all_ticks))
-            update_live_tick_histogram(fig, ax, np.array(all_ticks, dtype=int), args, cycle)
-
+            cycle_infos.append(info)
+            total_time = sum(x["duration_s"] for x in cycle_infos)
+            total_etr = sum(x["etr_count"] for x in cycle_infos)
+            print(f"[第 {cycle} 轮] ETR={info['etr_count']}, TIM2_N={info['n_total']}, saved={len(rows)}, 累计ETR={total_etr}, 平均CPS={total_etr / total_time:.2f}, 累计样本={len(all_ticks)}")
+            update_live_plot(fig, ax, np.array(all_ticks, dtype=int), args.tick_min, args.tick_max)
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，停止采集。")
     finally:
         ser.close()
-
-    ticks_np = np.array(all_ticks, dtype=int)
-    ns_np = np.array(all_ns, dtype=float)
-
-    csv_path = save_combined_csv(all_rows, cycle_infos, args.out)
-    tick_fig, ns_fig = save_final_histograms(ticks_np, ns_np, args)
-    print_final_statistics(ticks_np, ns_np, cycle_infos)
-
-    print(f"\n原始数据已保存至 {csv_path}")
-    if tick_fig is not None:
-        print(f"tick 直方图已保存至 {tick_fig}")
-        webbrowser.open(str(tick_fig))
-    if ns_fig is not None:
-        print(f"ns 直方图已保存至 {ns_fig}")
-        webbrowser.open(str(ns_fig))
-
-    if last_timclk is None:
-        print("\n警告：未从 STM32 解析到 TIMCLK，默认使用 72000000 Hz 做 tick-ns 换算。")
-        last_timclk = 72000000
-
+    ticks = np.array(all_ticks, dtype=int)
+    ns = np.array(all_ns, dtype=float)
     tick_ns = 1e9 / last_timclk
-    print(f"\n用于拟合换算：1 tick = {tick_ns:.6f} ns")
-    interactive_roi_fit(ticks_np, tick_ns, args.fig_prefix)
+    save_combined_csv(all_rows, cycle_infos, paths["csv"])
+    tick_html, tick_csv = save_tick_outputs(ticks, paths["tick_html"], paths["tick_csv"], args.tick_min, args.tick_max, args.open_html)
+    ns_html = ns_csv = None
+    if args.make_ns:
+        ns_html, ns_csv = save_ns_outputs_from_ticks(ticks, paths["ns_html"], paths["ns_csv"], tick_ns, args.tick_min, args.tick_max, args.open_html)
+    print_summary(ticks, ns, cycle_infos)
+    print(f"\nCSV 已保存至 {paths['csv']}")
+    print(f"tick 直方图已保存至 {tick_html}")
+    print(f"tick 直方图数据已保存至 {tick_csv}")
+    if args.make_ns:
+        print(f"ns 直方图已保存至 {ns_html}")
+        print(f"ns 直方图数据已保存至 {ns_csv}")
+    print(f"\nROI 拟合换算：1 tick = {tick_ns:.6f} ns")
+    if args.roi:
+        fit_single_roi(ticks, args.roi[0], args.roi[1], tick_ns, out_dir, args.name)
+    if args.interactive_roi:
+        def make_ns():
+            out_html, out_csv = save_ns_outputs_from_ticks(ticks, paths["ns_html"], paths["ns_csv"], tick_ns, args.tick_min, args.tick_max, True)
+            print(f"ns 直方图已保存至 {out_html}")
+            print(f"ns 直方图数据已保存至 {out_csv}")
+        roi_loop(ticks, tick_ns, out_dir, args.name, make_ns)
+
+
+def run_analyze(args):
+    out_dir = ensure_dir(args.out_dir)
+    csv_file = Path(args.csv)
+    if not csv_file.is_absolute():
+        csv_file = out_dir / csv_file
+    name = args.name if args.name else csv_file.stem
+    paths = paths_for(out_dir, name)
+    print("========== 文件分析模式 ==========")
+    print(f"读取 CSV    : {csv_file}")
+    print(f"输出目录    : {out_dir}")
+    print(f"输出前缀    : {name}\n")
+    ticks, ns, cycle_infos, timclk = load_latest_csv(csv_file)
+    tick_ns = 1e9 / timclk
+    tick_html, tick_csv = save_tick_outputs(ticks, paths["tick_html"], paths["tick_csv"], args.tick_min, args.tick_max, args.open_html)
+    ns_html = ns_csv = None
+    if args.make_ns:
+        ns_html, ns_csv = save_ns_outputs_from_ticks(ticks, paths["ns_html"], paths["ns_csv"], tick_ns, args.tick_min, args.tick_max, args.open_html)
+    print_summary(ticks, ns, cycle_infos)
+    print(f"\ntick 直方图已保存至 {tick_html}")
+    print(f"tick 直方图数据已保存至 {tick_csv}")
+    if args.make_ns:
+        print(f"ns 直方图已保存至 {ns_html}")
+        print(f"ns 直方图数据已保存至 {ns_csv}")
+    print(f"\nROI 拟合换算：1 tick = {tick_ns:.6f} ns")
+    if args.roi:
+        fit_single_roi(ticks, args.roi[0], args.roi[1], tick_ns, out_dir, name)
+    if args.interactive_roi:
+        def make_ns():
+            out_html, out_csv = save_ns_outputs_from_ticks(ticks, paths["ns_html"], paths["ns_csv"], tick_ns, args.tick_min, args.tick_max, True)
+            print(f"ns 直方图已保存至 {out_html}")
+            print(f"ns 直方图数据已保存至 {out_csv}")
+        roi_loop(ticks, tick_ns, out_dir, name, make_ns)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="STM32 pulse width analyzer: acquire and offline analyze")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    acq = sub.add_parser("acquire", help="串口采集并保存 CSV + tick HTML")
+    acq.add_argument("--port", default="COM6")
+    acq.add_argument("--baud", type=int, default=115200)
+    acq.add_argument("--timeout", type=float, default=3.0)
+    acq.add_argument("--cycle-time", type=int, default=1)
+    acq.add_argument("--max-cycles", type=int, default=None)
+    acq.add_argument("--verbose-dump", action="store_true")
+    acq.add_argument("--no-live-plot", action="store_true")
+    acq.add_argument("--out-dir", default=".")
+    acq.add_argument("--name", default="width_live")
+    acq.add_argument("--tick-min", type=int, default=None)
+    acq.add_argument("--tick-max", type=int, default=None)
+    acq.add_argument("--open-html", action="store_true")
+    acq.add_argument("--make-ns", action="store_true")
+    acq.add_argument("--roi", nargs=2, type=int, default=None)
+    acq.add_argument("--interactive-roi", action="store_true")
+    acq.set_defaults(func=run_acquire)
+
+    an = sub.add_parser("analyze", help="读取已有 CSV，离线画图与 ROI 拟合")
+    an.add_argument("--csv", required=True)
+    an.add_argument("--out-dir", default=".")
+    an.add_argument("--name", default=None)
+    an.add_argument("--tick-min", type=int, default=None)
+    an.add_argument("--tick-max", type=int, default=None)
+    an.add_argument("--open-html", action="store_true")
+    an.add_argument("--make-ns", action="store_true")
+    an.add_argument("--roi", nargs=2, type=int, default=None)
+    an.add_argument("--interactive-roi", action="store_true", default=True)
+    an.set_defaults(func=run_analyze)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
