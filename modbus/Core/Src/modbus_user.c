@@ -1,6 +1,12 @@
-#include "mb.h"
-#include "mbport.h"
+#include "main.h"
+#include "modbus_user.h"
+#include <stdint.h>
+#include "mb.h"        // 定义 eMBErrorCode、eMBRegisterMode
+#include "mbport.h"    // 间接包含 port.h，其中定义了 UCHAR、USHORT 等
+#define REG_INPUT_START   1U
+#define REG_INPUT_NREGS   8U
 
+static USHORT usInputBuf[REG_INPUT_NREGS] = {0};
 /*
  * FreeModbus 的寄存器回调地址是 1 基地址。
  *
@@ -70,11 +76,34 @@ eMBErrorCode eMBRegInputCB(UCHAR *pucRegBuffer,
                            USHORT usAddress,
                            USHORT usNRegs)
 {
-    (void)pucRegBuffer;
-    (void)usAddress;
-    (void)usNRegs;
+    USHORT usIndex;
 
-    return MB_ENOREG;
+    if (usAddress < REG_INPUT_START)
+    {
+        return MB_ENOREG;
+    }
+
+    usIndex = (USHORT)(usAddress - REG_INPUT_START);
+
+    if (((uint32_t)usIndex + usNRegs) > REG_INPUT_NREGS)
+    {
+        return MB_ENOREG;
+    }
+
+    while (usNRegs > 0U)
+    {
+        /* Modbus在线路上高字节在前 */
+        *pucRegBuffer++ =
+            (UCHAR)(usInputBuf[usIndex] >> 8);
+
+        *pucRegBuffer++ =
+            (UCHAR)(usInputBuf[usIndex] & 0xFFU);
+
+        usIndex++;
+        usNRegs--;
+    }
+
+    return MB_ENOERR;
 }
 
 eMBErrorCode eMBRegCoilsCB(UCHAR *pucRegBuffer,
@@ -99,4 +128,28 @@ eMBErrorCode eMBRegDiscreteCB(UCHAR *pucRegBuffer,
     (void)usNDiscrete;
 
     return MB_ENOREG;
+}
+
+void ModbusUser_UpdateInputRegisters(void)
+{
+    uint32_t now_ms = HAL_GetTick();
+
+    /* 地址0：固定测试值 */
+    usInputBuf[0] = 0x1234U;
+
+    /* 地址1：开机秒数，约每秒加1 */
+    usInputBuf[1] = (USHORT)(now_ms / 1000U);
+
+    /* 地址2和3：32位毫秒计数，高16位在前 */
+    usInputBuf[2] = (USHORT)(now_ms >> 16);
+    usInputBuf[3] = (USHORT)(now_ms & 0xFFFFU);
+
+    /* 地址4：从站地址 */
+    usInputBuf[4] = 1U;
+
+    /* 地址5：波特率除以100，即9600/100=96 */
+    usInputBuf[5] = 96U;
+
+    usInputBuf[6] = 0U;
+    usInputBuf[7] = 0U;
 }

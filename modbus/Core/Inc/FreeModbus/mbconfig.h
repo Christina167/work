@@ -24,7 +24,7 @@
 #define MB_FUNC_OTHER_REP_SLAVEID_ENABLED       (0)
 
 /* Input Register */
-#define MB_FUNC_READ_INPUT_ENABLED              (0)
+#define MB_FUNC_READ_INPUT_ENABLED              (1)
 
 /* Holding Register：阶段 1 需要的功能 */
 #define MB_FUNC_READ_HOLDING_ENABLED            (1)  /* 03 */
