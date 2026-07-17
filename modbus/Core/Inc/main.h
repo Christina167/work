@@ -53,7 +53,9 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+extern volatile uint16_t g_capture_width_ticks;
+extern volatile uint32_t g_capture_pulse_count;
+extern volatile uint8_t  g_capture_valid;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

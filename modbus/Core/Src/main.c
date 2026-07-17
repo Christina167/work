@@ -42,12 +42,18 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+volatile uint16_t g_capture_width_ticks = 0U;
+volatile uint32_t g_capture_pulse_count = 0U;
+volatile uint8_t  g_capture_valid = 0U;
 
+static volatile uint16_t g_rise_ccr1 = 0U;
+static volatile uint8_t  g_rise_valid = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -55,6 +61,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -95,8 +102,19 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 eMBErrorCode eStatus;
+
+if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1) != HAL_OK)
+{
+    Error_Handler();
+}
+
+if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2) != HAL_OK)
+{
+    Error_Handler();
+}
 
 eStatus = eMBInit(MB_RTU,
                   1U,          /* 从站地址 */
@@ -167,6 +185,70 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
 }
 
 /**
@@ -286,7 +368,46 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance != TIM2)
+    {
+        return;
+    }
 
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+        /* PA0上升沿 */
+        g_rise_ccr1 =
+            (uint16_t)HAL_TIM_ReadCapturedValue(
+                htim,
+                TIM_CHANNEL_1);
+
+        g_rise_valid = 1U;
+    }
+    else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+    {
+        /* PA0下降沿 */
+        uint16_t fall_ccr2 =
+            (uint16_t)HAL_TIM_ReadCapturedValue(
+                htim,
+                TIM_CHANNEL_2);
+
+        if (g_rise_valid != 0U)
+        {
+            /*
+             * uint16_t减法可以自动处理一次
+             * 65535 -> 0的计数器回绕。
+             */
+            g_capture_width_ticks =
+                (uint16_t)(fall_ccr2 - g_rise_ccr1);
+
+            g_capture_pulse_count++;
+            g_capture_valid = 1U;
+            g_rise_valid = 0U;
+        }
+    }
+}
 /* USER CODE END 4 */
 
 /**

@@ -4,7 +4,7 @@
 #include "mb.h"        // 定义 eMBErrorCode、eMBRegisterMode
 #include "mbport.h"    // 间接包含 port.h，其中定义了 UCHAR、USHORT 等
 #define REG_INPUT_START   1U
-#define REG_INPUT_NREGS   8U
+#define REG_INPUT_NREGS   10U
 
 static USHORT usInputBuf[REG_INPUT_NREGS] = {0};
 /*
@@ -134,22 +134,40 @@ void ModbusUser_UpdateInputRegisters(void)
 {
     uint32_t now_ms = HAL_GetTick();
 
-    /* 地址0：固定测试值 */
-    usInputBuf[0] = 0x1234U;
+    uint16_t width_ticks;
+    uint32_t pulse_count;
+    uint8_t capture_valid;
+    uint32_t primask;
 
-    /* 地址1：开机秒数，约每秒加1 */
+    /*
+     * 防止读取32位计数的过程中，
+     * TIM2中断刚好更新测量结果。
+     */
+    primask = __get_PRIMASK();
+    __disable_irq();
+
+    width_ticks = g_capture_width_ticks;
+    pulse_count = g_capture_pulse_count;
+    capture_valid = g_capture_valid;
+
+    __set_PRIMASK(primask);
+
+    usInputBuf[0] = 0x1234U;
     usInputBuf[1] = (USHORT)(now_ms / 1000U);
 
-    /* 地址2和3：32位毫秒计数，高16位在前 */
     usInputBuf[2] = (USHORT)(now_ms >> 16);
     usInputBuf[3] = (USHORT)(now_ms & 0xFFFFU);
 
-    /* 地址4：从站地址 */
     usInputBuf[4] = 1U;
-
-    /* 地址5：波特率除以100，即9600/100=96 */
     usInputBuf[5] = 96U;
 
-    usInputBuf[6] = 0U;
-    usInputBuf[7] = 0U;
+    /* 最新一次脉宽，单位tick */
+    usInputBuf[6] = width_ticks;
+
+    /* 有效脉冲总数，32位，高字在前 */
+    usInputBuf[7] = (USHORT)(pulse_count >> 16);
+    usInputBuf[8] = (USHORT)(pulse_count & 0xFFFFU);
+
+    /* 0：尚未捕获；1：已经捕获过有效脉冲 */
+    usInputBuf[9] = (USHORT)capture_valid;
 }
