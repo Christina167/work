@@ -4,7 +4,7 @@
 #include "mb.h"        // 定义 eMBErrorCode、eMBRegisterMode
 #include "mbport.h"    // 间接包含 port.h，其中定义了 UCHAR、USHORT 等
 #define REG_INPUT_START   1U
-#define REG_INPUT_NREGS   10U
+#define REG_INPUT_NREGS   14U
 
 static USHORT usInputBuf[REG_INPUT_NREGS] = {0};
 /*
@@ -18,7 +18,7 @@ static USHORT usInputBuf[REG_INPUT_NREGS] = {0};
 
 static USHORT usHoldingBuf[REG_HOLDING_NREGS] =
 {
-    100U, 200U, 300U, 400U,
+    0U,   200U, 300U, 400U,
     500U, 600U, 700U, 800U,
     0U,   0U,   0U,   0U,
     0U,   0U,   0U,   0U
@@ -133,7 +133,7 @@ eMBErrorCode eMBRegDiscreteCB(UCHAR *pucRegBuffer,
 void ModbusUser_UpdateInputRegisters(void)
 {
     uint32_t now_ms = HAL_GetTick();
-
+    uint32_t etr_count;
     uint16_t width_ticks;
     uint32_t pulse_count;
     uint8_t capture_valid;
@@ -146,6 +146,7 @@ void ModbusUser_UpdateInputRegisters(void)
     primask = __get_PRIMASK();
     __disable_irq();
 
+    etr_count = Measurement_GetEtrCount();
     width_ticks = g_capture_width_ticks;
     pulse_count = g_capture_pulse_count;
     capture_valid = g_capture_valid;
@@ -164,10 +165,57 @@ void ModbusUser_UpdateInputRegisters(void)
     /* 最新一次脉宽，单位tick */
     usInputBuf[6] = width_ticks;
 
+
+
+
     /* 有效脉冲总数，32位，高字在前 */
     usInputBuf[7] = (USHORT)(pulse_count >> 16);
     usInputBuf[8] = (USHORT)(pulse_count & 0xFFFFU);
 
     /* 0：尚未捕获；1：已经捕获过有效脉冲 */
     usInputBuf[9] = (USHORT)capture_valid;
+    /* TIM1 ETR计数，高16位在前 */
+    usInputBuf[10] = (USHORT)(etr_count >> 16);
+    usInputBuf[11] = (USHORT)(etr_count & 0xFFFFU);
+
+    /* 测量状态：0停止，1运行 */
+    usInputBuf[12] = (USHORT)g_measurement_running;
+
+    /* 保留作错误标志 */
+    usInputBuf[13] = 0U;
+}
+
+void ModbusUser_ProcessCommands(void)
+{
+    USHORT command = usHoldingBuf[0];
+
+    if (command == 0U)
+    {
+        return;
+    }
+
+    /*
+     * 读取后立即清零，保证每个命令只执行一次。
+     */
+    usHoldingBuf[0] = 0U;
+
+    switch (command)
+    {
+        case 1U:
+            Measurement_Start();
+            break;
+
+        case 2U:
+            Measurement_Stop();
+            break;
+
+        case 3U:
+            Measurement_Stop();
+            Measurement_Clear();
+            break;
+
+        default:
+            /* 未定义命令：忽略 */
+            break;
+    }
 }

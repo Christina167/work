@@ -3,4 +3,6 @@
 
 void ModbusUser_UpdateInputRegisters(void);
 
+void ModbusUser_ProcessCommands(void);
+
 #endif

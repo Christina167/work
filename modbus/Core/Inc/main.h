@@ -56,6 +56,16 @@ void Error_Handler(void);
 extern volatile uint16_t g_capture_width_ticks;
 extern volatile uint32_t g_capture_pulse_count;
 extern volatile uint8_t  g_capture_valid;
+
+extern volatile uint16_t g_capture_width_ticks;
+extern volatile uint32_t g_capture_pulse_count;
+extern volatile uint8_t  g_capture_valid;
+extern volatile uint8_t  g_measurement_running;
+
+void Measurement_Start(void);
+void Measurement_Stop(void);
+void Measurement_Clear(void);
+uint32_t Measurement_GetEtrCount(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

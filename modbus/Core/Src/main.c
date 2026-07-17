@@ -42,6 +42,7 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
@@ -54,6 +55,9 @@ volatile uint8_t  g_capture_valid = 0U;
 
 static volatile uint16_t g_rise_ccr1 = 0U;
 static volatile uint8_t  g_rise_valid = 0U;
+
+volatile uint32_t g_etr_overflow = 0U;
+volatile uint8_t g_measurement_running = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,6 +66,7 @@ static void MX_GPIO_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -103,8 +108,12 @@ int main(void)
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_TIM2_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 eMBErrorCode eStatus;
+
+HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 
 if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1) != HAL_OK)
 {
@@ -144,6 +153,7 @@ if (eStatus != MB_ENOERR)
     /* USER CODE BEGIN 3 */
   ModbusUser_UpdateInputRegisters();
   (void)eMBPoll();
+  ModbusUser_ProcessCommands();
   }
   /* USER CODE END 3 */
 }
@@ -185,6 +195,55 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_ETRMODE2;
+  sClockSourceConfig.ClockPolarity = TIM_CLOCKPOLARITY_NONINVERTED;
+  sClockSourceConfig.ClockPrescaler = TIM_CLOCKPRESCALER_DIV1;
+  sClockSourceConfig.ClockFilter = 0;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
 }
 
 /**
@@ -375,9 +434,14 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         return;
     }
 
+    if (g_measurement_running == 0U)
+    {
+        g_rise_valid = 0U;
+        return;
+    }
+
     if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
-        /* PA0上升沿 */
         g_rise_ccr1 =
             (uint16_t)HAL_TIM_ReadCapturedValue(
                 htim,
@@ -387,7 +451,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     }
     else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
     {
-        /* PA0下降沿 */
         uint16_t fall_ccr2 =
             (uint16_t)HAL_TIM_ReadCapturedValue(
                 htim,
@@ -395,10 +458,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
         if (g_rise_valid != 0U)
         {
-            /*
-             * uint16_t减法可以自动处理一次
-             * 65535 -> 0的计数器回绕。
-             */
             g_capture_width_ticks =
                 (uint16_t)(fall_ccr2 - g_rise_ccr1);
 
@@ -407,6 +466,73 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
             g_rise_valid = 0U;
         }
     }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1)
+    {
+        g_etr_overflow++;
+    }
+}
+
+uint32_t Measurement_GetEtrCount(void)
+{
+    uint32_t high1;
+    uint32_t high2;
+    uint16_t low;
+
+    do
+    {
+        high1 = g_etr_overflow;
+        low = (uint16_t)__HAL_TIM_GET_COUNTER(&htim1);
+        high2 = g_etr_overflow;
+    }
+    while (high1 != high2);
+
+    return high2 * 65536UL + low;
+}
+
+void Measurement_Clear(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    g_capture_width_ticks = 0U;
+    g_capture_pulse_count = 0U;
+    g_capture_valid = 0U;
+
+    g_rise_ccr1 = 0U;
+    g_rise_valid = 0U;
+
+    g_etr_overflow = 0U;
+
+    __HAL_TIM_SET_COUNTER(&htim1, 0U);
+    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
+    __set_PRIMASK(primask);
+}
+
+void Measurement_Stop(void)
+{
+    HAL_TIM_Base_Stop_IT(&htim1);
+
+    g_measurement_running = 0U;
+    g_rise_valid = 0U;
+}
+
+void Measurement_Start(void)
+{
+    Measurement_Stop();
+    Measurement_Clear();
+
+    if (HAL_TIM_Base_Start_IT(&htim1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    g_measurement_running = 1U;
 }
 /* USER CODE END 4 */
 
