@@ -58,6 +58,10 @@ static volatile uint8_t  g_rise_valid = 0U;
 
 volatile uint32_t g_etr_overflow = 0U;
 volatile uint8_t g_measurement_running = 0U;
+
+static volatile uint32_t g_histogram[HISTOGRAM_BIN_COUNT];
+
+static volatile uint32_t g_histogram_out_of_range = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -111,9 +115,6 @@ int main(void)
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 eMBErrorCode eStatus;
-
-HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
-HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 
 if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1) != HAL_OK)
 {
@@ -458,12 +459,32 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
         if (g_rise_valid != 0U)
         {
-            g_capture_width_ticks =
-                (uint16_t)(fall_ccr2 - g_rise_ccr1);
+        	uint16_t width_ticks =
+        	    (uint16_t)(fall_ccr2 - g_rise_ccr1);
 
-            g_capture_pulse_count++;
-            g_capture_valid = 1U;
-            g_rise_valid = 0U;
+        	g_capture_width_ticks = width_ticks;
+        	g_capture_pulse_count++;
+        	g_capture_valid = 1U;
+
+        	if (width_ticks < HISTOGRAM_BIN_COUNT)
+        	{
+        	    /*
+        	     * 防止32位桶计数溢出后重新变成0。
+        	     */
+        	    if (g_histogram[width_ticks] < 0xFFFFFFFFUL)
+        	    {
+        	        g_histogram[width_ticks]++;
+        	    }
+        	}
+        	else
+        	{
+        	    if (g_histogram_out_of_range < 0xFFFFFFFFUL)
+        	    {
+        	        g_histogram_out_of_range++;
+        	    }
+        	}
+
+        	g_rise_valid = 0U;
         }
     }
 }
@@ -496,6 +517,7 @@ uint32_t Measurement_GetEtrCount(void)
 void Measurement_Clear(void)
 {
     uint32_t primask = __get_PRIMASK();
+    uint16_t i;
 
     __disable_irq();
 
@@ -511,9 +533,15 @@ void Measurement_Clear(void)
     __HAL_TIM_SET_COUNTER(&htim1, 0U);
     __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
 
+    for (i = 0U; i < HISTOGRAM_BIN_COUNT; i++)
+    {
+        g_histogram[i] = 0U;
+    }
+
+    g_histogram_out_of_range = 0U;
+
     __set_PRIMASK(primask);
 }
-
 void Measurement_Stop(void)
 {
     HAL_TIM_Base_Stop_IT(&htim1);
@@ -533,6 +561,21 @@ void Measurement_Start(void)
     }
 
     g_measurement_running = 1U;
+}
+
+uint32_t Measurement_GetHistogramBin(uint16_t bin)
+{
+    if (bin >= HISTOGRAM_BIN_COUNT)
+    {
+        return 0U;
+    }
+
+    return g_histogram[bin];
+}
+
+uint32_t Measurement_GetHistogramOutOfRange(void)
+{
+    return g_histogram_out_of_range;
 }
 /* USER CODE END 4 */
 

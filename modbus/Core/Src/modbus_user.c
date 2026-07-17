@@ -4,8 +4,10 @@
 #include "mb.h"        // 定义 eMBErrorCode、eMBRegisterMode
 #include "mbport.h"    // 间接包含 port.h，其中定义了 UCHAR、USHORT 等
 #define REG_INPUT_START   1U
-#define REG_INPUT_NREGS   14U
+#define REG_INPUT_NREGS   20U
 
+#define HIST_INPUT_START  100U
+#define HIST_INPUT_NREGS  (HISTOGRAM_BIN_COUNT * 2U)
 static USHORT usInputBuf[REG_INPUT_NREGS] = {0};
 /*
  * FreeModbus 的寄存器回调地址是 1 基地址。
@@ -76,36 +78,71 @@ eMBErrorCode eMBRegInputCB(UCHAR *pucRegBuffer,
                            USHORT usAddress,
                            USHORT usNRegs)
 {
-    USHORT usIndex;
+    USHORT protocolAddress;
 
-    if (usAddress < REG_INPUT_START)
+    /*
+     * FreeModbus传入的是1基地址，
+     * 转成主机看到的0基地址。
+     */
+    if (usAddress == 0U)
     {
         return MB_ENOREG;
     }
 
-    usIndex = (USHORT)(usAddress - REG_INPUT_START);
-
-    if (((uint32_t)usIndex + usNRegs) > REG_INPUT_NREGS)
-    {
-        return MB_ENOREG;
-    }
+    protocolAddress = (USHORT)(usAddress - 1U);
 
     while (usNRegs > 0U)
     {
-        /* Modbus在线路上高字节在前 */
-        *pucRegBuffer++ =
-            (UCHAR)(usInputBuf[usIndex] >> 8);
+        USHORT value;
+
+        if (protocolAddress < REG_INPUT_NREGS)
+        {
+            /* 普通状态寄存器0～19 */
+            value = usInputBuf[protocolAddress];
+        }
+        else if ((protocolAddress >= HIST_INPUT_START) &&
+                 ((uint32_t)protocolAddress <
+                  ((uint32_t)HIST_INPUT_START +
+                   HIST_INPUT_NREGS)))
+        {
+            uint16_t offset =
+                (uint16_t)(protocolAddress -
+                           HIST_INPUT_START);
+
+            uint16_t bin =
+                (uint16_t)(offset / 2U);
+
+            uint32_t count =
+                Measurement_GetHistogramBin(bin);
+
+            if ((offset & 1U) == 0U)
+            {
+                /* 偶数地址：高16位 */
+                value = (USHORT)(count >> 16);
+            }
+            else
+            {
+                /* 奇数地址：低16位 */
+                value = (USHORT)(count & 0xFFFFU);
+            }
+        }
+        else
+        {
+            return MB_ENOREG;
+        }
 
         *pucRegBuffer++ =
-            (UCHAR)(usInputBuf[usIndex] & 0xFFU);
+            (UCHAR)(value >> 8);
 
-        usIndex++;
+        *pucRegBuffer++ =
+            (UCHAR)(value & 0xFFU);
+
+        protocolAddress++;
         usNRegs--;
     }
 
     return MB_ENOERR;
 }
-
 eMBErrorCode eMBRegCoilsCB(UCHAR *pucRegBuffer,
                            USHORT usAddress,
                            USHORT usNCoils,
@@ -138,18 +175,20 @@ void ModbusUser_UpdateInputRegisters(void)
     uint32_t pulse_count;
     uint8_t capture_valid;
     uint32_t primask;
-
+    uint32_t histogram_overflow;
     /*
      * 防止读取32位计数的过程中，
      * TIM2中断刚好更新测量结果。
      */
+    etr_count = Measurement_GetEtrCount();
+
     primask = __get_PRIMASK();
     __disable_irq();
 
-    etr_count = Measurement_GetEtrCount();
     width_ticks = g_capture_width_ticks;
     pulse_count = g_capture_pulse_count;
     capture_valid = g_capture_valid;
+    histogram_overflow = Measurement_GetHistogramOutOfRange();
 
     __set_PRIMASK(primask);
 
@@ -183,6 +222,20 @@ void ModbusUser_UpdateInputRegisters(void)
 
     /* 保留作错误标志 */
     usInputBuf[13] = 0U;
+    /* 直方图元数据 */
+    usInputBuf[14] = HISTOGRAM_BIN_COUNT;
+    usInputBuf[15] = 0U;
+    usInputBuf[16] = 1U;
+
+    /* 超出直方图范围的脉冲数 */
+    usInputBuf[17] =
+        (USHORT)(histogram_overflow >> 16);
+
+    usInputBuf[18] =
+        (USHORT)(histogram_overflow & 0xFFFFU);
+
+    /* 直方图Modbus起始地址 */
+    usInputBuf[19] = HIST_INPUT_START;
 }
 
 void ModbusUser_ProcessCommands(void)
