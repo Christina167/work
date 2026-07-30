@@ -1,6 +1,5 @@
 import argparse
 import csv
-import json
 import re
 import threading
 import time
@@ -9,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 try:
     import serial
@@ -236,20 +236,20 @@ def write_plotly_hist_html(x, y, html_file, title, xlabel, x_unit="", notes=None
         "shapes": shapes,
         "annotations": annotations,
     }
+    figure = go.Figure(data=traces, layout=layout)
+    plot_div = figure.to_html(
+        full_html=False,
+        include_plotlyjs=True,
+        config={"responsive": True, "scrollZoom": True},
+    )
     body_notes = "".join(f"<li>{n}</li>" for n in notes)
     html_text = f'''<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><title>{title}</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script></head>
+<head><meta charset="utf-8"><title>{title}</title></head>
 <body style="font-family:Arial,'Microsoft YaHei',sans-serif;margin:20px;">
 <h2>{title}</h2>
 <ul>{body_notes}</ul>
-<div id="chart" style="width:1200px;height:680px;"></div>
-<script>
-const traces = {json.dumps(traces, ensure_ascii=False)};
-const layout = {json.dumps(layout, ensure_ascii=False)};
-Plotly.newPlot('chart', traces, layout, {{responsive:true, scrollZoom:true}});
-</script>
+{plot_div}
 </body></html>'''
     Path(html_file).write_text(html_text, encoding="utf-8")
     return Path(html_file)
